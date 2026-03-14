@@ -30,7 +30,7 @@
             {%- do process_bucket_column(col, partition_key, table, ns, counter.value) -%}
 
             {# Logic for non-bucketed columns #}
-            {%- set bucket_match = modules.re.search('bucket\((.+?),\s*(\d+)\)', partition_key) -%}
+            {%- set bucket_match = modules.re.search('bucket\(\s*(\d+)\s*,\s*(.+?)\s*\)', partition_key) or modules.re.search('bucket\((.+?),\s*(\d+)\)', partition_key) -%}
             {%- if not bucket_match -%}
                 {# For non-bucketed columns, format partition key and value #}
                 {%- set column_type = adapter.convert_type(table, counter.value) -%}

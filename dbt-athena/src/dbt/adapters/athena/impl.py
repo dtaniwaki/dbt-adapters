@@ -1409,11 +1409,16 @@ class AthenaAdapter(SQLAdapter):
     def format_one_partition_key(self, partition_key: str) -> str:
         """Check if partition key uses Iceberg hidden partitioning or bucket partitioning"""
         hidden = re.search(r"^(hour|day|month|year)\((.+)\)", partition_key.lower())
-        bucket = re.search(r"bucket\((.+),", partition_key.lower())
+        # Iceberg format: bucket(N, col) — first arg is bucket count
+        iceberg_bucket = re.search(r"bucket\(\s*(\d+)\s*,\s*(.+?)\s*\)", partition_key.lower())
+        # Hive format: bucket(col, N) — second arg is bucket count
+        hive_bucket = re.search(r"bucket\((.+?),\s*(\d+)\)", partition_key.lower())
         if hidden:
             return f"date_trunc('{hidden.group(1)}', {hidden.group(2)})"
-        elif bucket:
-            return bucket.group(1)
+        elif iceberg_bucket:
+            return iceberg_bucket.group(2)
+        elif hive_bucket:
+            return hive_bucket.group(1)
         else:
             return partition_key.lower()
 

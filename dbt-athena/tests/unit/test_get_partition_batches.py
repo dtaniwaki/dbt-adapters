@@ -56,9 +56,9 @@ def _format_partition_keys(partitioned_by):
     """Stub for adapter.format_partition_keys."""
     parts = []
     for key in partitioned_by:
-        bucket_match = re.search(r"bucket\((.+?),\s*(\d+)\)", key)
-        if bucket_match:
-            parts.append(bucket_match.group(1))
+        col = _extract_bucket_column(key)
+        if col:
+            parts.append(col)
         else:
             parts.append(f'"{key}"')
     return ", ".join(parts)
@@ -66,10 +66,21 @@ def _format_partition_keys(partitioned_by):
 
 def _format_one_partition_key(key):
     """Stub for adapter.format_one_partition_key."""
-    bucket_match = re.search(r"bucket\((.+?),\s*(\d+)\)", key)
-    if bucket_match:
-        return bucket_match.group(1)
+    col = _extract_bucket_column(key)
+    if col:
+        return col
     return f'"{key}"'
+
+
+def _extract_bucket_column(key):
+    """Extract column name from bucket() in both Iceberg and Hive formats."""
+    iceberg_match = re.search(r"bucket\(\s*(\d+)\s*,\s*(.+?)\s*\)", key)
+    if iceberg_match:
+        return iceberg_match.group(2)
+    hive_match = re.search(r"bucket\((.+?),\s*(\d+)\)", key)
+    if hive_match:
+        return hive_match.group(1)
+    return None
 
 
 def _format_value_for_partition(value, column_type):
@@ -203,6 +214,22 @@ class TestBucketOnlyBatching:
             "col IN ('e')",
         ]
 
+    def test_iceberg_bucket_only(self):
+        """Iceberg format bucket(N, col) should work the same as Hive format."""
+        result = _render_macro(
+            config={
+                "partitioned_by": ["bucket(2, col)"],
+                "partitions_limit": 2,
+            },
+            rows=[["a"], ["b"], ["c"], ["d"], ["e"]],
+            column_types=["varchar"],
+        )
+        assert result == [
+            "col IN ('a', 'b')",
+            "col IN ('c', 'd')",
+            "col IN ('e')",
+        ]
+
 
 class TestBucketWithPartitionsBatching:
     """Tests for bucket + non-bucket partition columns (AND structure)."""
@@ -224,6 +251,24 @@ class TestBucketWithPartitionsBatching:
         assert result == [
             "(\"date_col\"=DATE'2024-01-01') and user_id IN ('alice')",
             "(\"date_col\"=DATE'2024-01-01') and user_id IN ('bob')",
+        ]
+
+    def test_single_partition_with_iceberg_bucket(self):
+        """Iceberg format bucket(N, col) combined with partition columns."""
+        result = _render_macro(
+            config={
+                "partitioned_by": ["date_col", "bucket(256, uid_hash)"],
+                "partitions_limit": 100,
+            },
+            rows=[
+                ["2024-01-01", "alice"],
+                ["2024-01-01", "bob"],
+            ],
+            column_types=["date", "varchar"],
+        )
+        assert result == [
+            "(\"date_col\"=DATE'2024-01-01') and uid_hash IN ('alice')",
+            "(\"date_col\"=DATE'2024-01-01') and uid_hash IN ('bob')",
         ]
 
     def test_multiple_partitions_with_bucket(self):

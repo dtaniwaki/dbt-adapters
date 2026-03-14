@@ -1293,6 +1293,10 @@ class TestAthenaAdapter:
                 ["year(date_col)", "bucket(col_name, 10)", "default_partition_key"],
                 "date_trunc('year', date_col), col_name, default_partition_key",
             ),
+            (
+                ["day(measured_at_jst)", "bucket(256, uid_hash)"],
+                "date_trunc('day', measured_at_jst), uid_hash",
+            ),
         ],
     )
     def test_format_partition_keys(self, partition_keys, expected_result):
@@ -1303,6 +1307,8 @@ class TestAthenaAdapter:
         [
             ("month(hidden)", "date_trunc('month', hidden)"),
             ("bucket(bucket_col, 10)", "bucket_col"),
+            ("bucket(256, uid_hash)", "uid_hash"),
+            ("bucket( 128 , col_name )", "col_name"),
             ("regular_col", "regular_col"),
         ],
     )

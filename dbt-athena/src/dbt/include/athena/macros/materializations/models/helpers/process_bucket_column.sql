@@ -1,13 +1,23 @@
 {% macro process_bucket_column(col, partition_key, table, ns, col_index) %}
     {# Extract bucket information from the partition key #}
-    {%- set bucket_match = modules.re.search('bucket\((.+?),\s*(\d+)\)', partition_key) -%}
+    {# Iceberg format: bucket(N, col) — first arg is bucket count #}
+    {%- set iceberg_bucket_match = modules.re.search('bucket\(\s*(\d+)\s*,\s*(.+?)\s*\)', partition_key) -%}
+    {# Hive format: bucket(col, N) — second arg is bucket count #}
+    {%- set hive_bucket_match = modules.re.search('bucket\((.+?),\s*(\d+)\)', partition_key) -%}
 
-    {%- if bucket_match -%}
-        {# For bucketed columns, compute bucket numbers and conditions #}
+    {%- if iceberg_bucket_match -%}
         {%- set column_type = adapter.convert_type(table, col_index) -%}
         {%- set ns.is_bucketed = true -%}
-        {%- set ns.bucket_column = bucket_match[1] -%}
-        {%- set bucket_num = adapter.murmur3_hash(col, bucket_match[2] | int) -%}
+        {%- set ns.bucket_column = iceberg_bucket_match[2] -%}
+        {%- set bucket_num = adapter.murmur3_hash(col, iceberg_bucket_match[1] | int) -%}
+    {%- elif hive_bucket_match -%}
+        {%- set column_type = adapter.convert_type(table, col_index) -%}
+        {%- set ns.is_bucketed = true -%}
+        {%- set ns.bucket_column = hive_bucket_match[1] -%}
+        {%- set bucket_num = adapter.murmur3_hash(col, hive_bucket_match[2] | int) -%}
+    {%- endif -%}
+
+    {%- if iceberg_bucket_match or hive_bucket_match -%}
         {%- set formatted_value, comp_func = adapter.format_value_for_partition(col, column_type) -%}
 
         {%- if bucket_num not in ns.bucket_numbers %}
