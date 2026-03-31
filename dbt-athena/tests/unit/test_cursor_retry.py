@@ -56,6 +56,16 @@ class TestAthenaCursorRetry:
                 athena_cursor.execute("SELECT 1", catch_partitions_limit=False)
             assert athena_cursor._execute.call_count == 3
 
+    def test_no_retry_on_query_exhausted_resources(self, athena_cursor):
+        with patch.object(
+            athena_cursor,
+            "_execute",
+            side_effect=OperationalError("Query exhausted resources at this scale factor"),
+        ):
+            with pytest.raises(OperationalError, match="Query exhausted resources"):
+                athena_cursor.execute("SELECT 1")
+            assert athena_cursor._execute.call_count == 1
+
     def test_retry_on_transient_error(self, athena_cursor):
         with patch.object(
             athena_cursor, "_execute", side_effect=OperationalError("Some transient error")
