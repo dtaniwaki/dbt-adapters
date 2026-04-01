@@ -102,6 +102,8 @@ class AthenaConfig(AdapterConfig):
         seed_s3_upload_args: Dictionary containing boto3 ExtraArgs when uploading to S3.
         partitions_limit: Maximum numbers of partitions when batching.
         force_batch: Skip creating the table as ctas and run the operation directly in batch insert mode.
+        batch_fallback: When True (default), automatically fall back to batch mode on TOO_MANY_OPEN_PARTITIONS.
+            When False, raise the error instead of falling back.
         unique_tmp_table_suffix: Enforce the use of a unique id as tmp table suffix instead of __dbt_tmp.
         temp_schema: Define in which schema to create temporary tables used in incremental runs.
     """
@@ -125,6 +127,7 @@ class AthenaConfig(AdapterConfig):
     seed_s3_upload_args: Optional[Dict[str, Any]] = None
     partitions_limit: Optional[int] = None
     force_batch: bool = False
+    batch_fallback: bool = True
     unique_tmp_table_suffix: bool = False
     temp_schema: Optional[str] = None
 
@@ -1392,11 +1395,13 @@ class AthenaAdapter(SQLAdapter):
         return {k: v for k, v in table.items() if k in TableInputTypeDef.__annotations__}
 
     @available
-    def run_query_with_partitions_limit_catching(self, sql: str) -> str:
+    def run_query_with_partitions_limit_catching(
+        self, sql: str, batch_fallback: bool = True
+    ) -> str:
         try:
             cursor = self._run_query(sql, catch_partitions_limit=True)
         except OperationalError as e:
-            if "TOO_MANY_OPEN_PARTITIONS" in str(e):
+            if "TOO_MANY_OPEN_PARTITIONS" in str(e) and batch_fallback:
                 return "TOO_MANY_OPEN_PARTITIONS"
             raise e
         return f'{{"rowcount":{cursor.rowcount},"data_scanned_in_bytes":{cursor.data_scanned_in_bytes}}}'

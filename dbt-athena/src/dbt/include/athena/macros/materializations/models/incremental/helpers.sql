@@ -53,6 +53,7 @@
     target_relation,
     existing_relation,
     force_batch,
+    batch_fallback=True,
     statement_name="main"
   )
 %}
@@ -73,7 +74,7 @@
               );
       {%- endset -%}
 
-      {%- set query_result =  adapter.run_query_with_partitions_limit_catching(insert_full) -%}
+      {%- set query_result =  adapter.run_query_with_partitions_limit_catching(insert_full, batch_fallback) -%}
       {%- do log('QUERY RESULT: ' ~ query_result) -%}
       {%- if query_result == 'TOO_MANY_OPEN_PARTITIONS' -%}
           {% do batch_incremental_insert(tmp_relation, target_relation, dest_cols_csv) %}
