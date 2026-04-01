@@ -1406,18 +1406,18 @@ class TestRunQueryWithPartitionsLimitCatching:
         self.adapter = AthenaAdapter(config, get_context("spawn"))
         inject_adapter(self.adapter, AthenaPlugin)
 
-    def test_batch_fallback_true_returns_string(self):
+    def test_default_fallback_returns_string(self):
         with mock.patch.object(
             self.adapter,
             "_run_query",
             side_effect=OperationalError("TOO_MANY_OPEN_PARTITIONS"),
         ):
             result = self.adapter.run_query_with_partitions_limit_catching(
-                "SELECT 1", batch_fallback=True
+                "SELECT 1", disable_batch_fallback=False
             )
             assert result == "TOO_MANY_OPEN_PARTITIONS"
 
-    def test_batch_fallback_false_raises_error(self):
+    def test_disable_batch_fallback_raises_error(self):
         with mock.patch.object(
             self.adapter,
             "_run_query",
@@ -1425,7 +1425,7 @@ class TestRunQueryWithPartitionsLimitCatching:
         ):
             with pytest.raises(OperationalError, match="TOO_MANY_OPEN_PARTITIONS"):
                 self.adapter.run_query_with_partitions_limit_catching(
-                    "SELECT 1", batch_fallback=False
+                    "SELECT 1", disable_batch_fallback=True
                 )
 
     def test_other_errors_always_raise(self):
@@ -1436,7 +1436,7 @@ class TestRunQueryWithPartitionsLimitCatching:
         ):
             with pytest.raises(OperationalError, match="SOME_OTHER_ERROR"):
                 self.adapter.run_query_with_partitions_limit_catching(
-                    "SELECT 1", batch_fallback=True
+                    "SELECT 1", disable_batch_fallback=False
                 )
 
     def test_success_returns_json(self):

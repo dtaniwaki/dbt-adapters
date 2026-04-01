@@ -10,7 +10,7 @@
   {% set lf_grants = config.get('lf_grants') %}
   {% set partitioned_by = config.get('partitioned_by') %}
   {% set force_batch = config.get('force_batch', False) | as_bool -%}
-  {% set batch_fallback = config.get('batch_fallback', True) | as_bool -%}
+  {% set disable_batch_fallback = config.get('disable_batch_fallback', False) | as_bool -%}
   {% set unique_tmp_table_suffix = config.get('unique_tmp_table_suffix', False) | as_bool -%}
   {% set temp_schema = config.get('temp_schema') %}
   {% set target_relation = this.incorporate(type='table') %}
@@ -56,7 +56,7 @@
 
   -- Relation doesn't exist, do full build --
   {% if existing_relation is none %}
-    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch, batch_fallback) -%}
+    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch, disable_batch_fallback) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -91,7 +91,7 @@
     {%- endif -%}
 
     -- create the full refresh version of the incremental iceberg table
-    {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, model_language, force_batch, batch_fallback) -%}
+    {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, model_language, force_batch, disable_batch_fallback) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -119,7 +119,7 @@
   -- Running in full refresh, drop existing relation, and do full build --
   {% elif existing_relation.is_view or should_full_refresh() %}
     {% do drop_relation(existing_relation) %}
-    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch, batch_fallback) -%}
+    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch, disable_batch_fallback) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -132,7 +132,7 @@
     {% if old_tmp_relation is not none %}
       {% do drop_relation(old_tmp_relation) %}
     {% endif %}
-    {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch, batch_fallback) -%}
+    {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch, disable_batch_fallback) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -140,7 +140,7 @@
     {%- endif -%}
     {% do delete_overlapping_partitions(target_relation, tmp_relation, partitioned_by) %}
     {% set build_sql = incremental_insert(
-        on_schema_change, tmp_relation, target_relation, existing_relation, force_batch, batch_fallback
+        on_schema_change, tmp_relation, target_relation, existing_relation, force_batch, disable_batch_fallback
       )
     %}
     {% do to_drop.append(tmp_relation) %}
@@ -150,14 +150,14 @@
     {% if old_tmp_relation is not none %}
       {% do drop_relation(old_tmp_relation) %}
     {% endif %}
-    {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch, batch_fallback) -%}
+    {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch, disable_batch_fallback) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
       {% endcall %}
     {%- endif -%}
     {% set build_sql = incremental_insert(
-        on_schema_change, tmp_relation, target_relation, existing_relation, force_batch, batch_fallback
+        on_schema_change, tmp_relation, target_relation, existing_relation, force_batch, disable_batch_fallback
       )
     %}
     {% do to_drop.append(tmp_relation) %}
@@ -190,7 +190,7 @@
     {% if old_tmp_relation is not none %}
       {% do drop_relation(old_tmp_relation) %}
     {% endif %}
-    {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch, batch_fallback) -%}
+    {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch, disable_batch_fallback) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -207,7 +207,7 @@
         update_condition=update_condition,
         insert_condition=insert_condition,
         force_batch=force_batch,
-        batch_fallback=batch_fallback,
+        disable_batch_fallback=disable_batch_fallback,
       )
     %}
     {% do to_drop.append(tmp_relation) %}
