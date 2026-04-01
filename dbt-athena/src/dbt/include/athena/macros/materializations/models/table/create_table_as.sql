@@ -200,7 +200,7 @@
 
 {%- endmacro %}
 
-{% macro safe_create_table_as(temporary, relation, compiled_code, language='sql', force_batch=False) -%}
+{% macro safe_create_table_as(temporary, relation, compiled_code, language='sql', force_batch=False, disable_batch_fallback=False) -%}
     {%- if language != 'sql' -%}
         {{ return(create_table_as(temporary, relation, compiled_code, language)) }}
     {%- elif force_batch -%}
@@ -211,7 +211,7 @@
           {%- do run_query(create_table_as(temporary, relation, compiled_code, language, true)) -%}
           {%- set compiled_code_result = relation ~ ' as temporary relation without partitioning created' -%}
         {%- else -%}
-          {%- set compiled_code_result = adapter.run_query_with_partitions_limit_catching(create_table_as(temporary, relation, compiled_code)) -%}
+          {%- set compiled_code_result = adapter.run_query_with_partitions_limit_catching(create_table_as(temporary, relation, compiled_code), disable_batch_fallback) -%}
           {%- do log('COMPILED CODE RESULT: ' ~ compiled_code_result) -%}
           {%- if compiled_code_result == 'TOO_MANY_OPEN_PARTITIONS' -%}
             {%- do create_table_as_with_partitions(temporary, relation, compiled_code, language) -%}
