@@ -51,6 +51,8 @@
   -- `BEGIN` happens here:
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
+  {%- do adapter.set_model_timeout(config.get('model_timeout_seconds')) -%}
+
   {% set to_drop = [] %}
 
   -- Relation doesn't exist, do full build --
@@ -247,6 +249,8 @@
   {% do persist_docs(target_relation, model) %}
 
   {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, False) %}
+
+  {%- do adapter.clear_model_timeout() -%}
 
   {{ return({'relations': [target_relation]}) }}
 
