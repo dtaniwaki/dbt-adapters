@@ -34,6 +34,7 @@ from typing_extensions import Self
 
 from dbt.adapters.athena.config import get_boto3_config
 from dbt.adapters.athena.constants import LOGGER
+from dbt.adapters.athena.exceptions import AthenaQueryTimeoutError
 from dbt.adapters.athena.query_headers import AthenaMacroQueryStringSetter
 from dbt.adapters.athena.session import get_boto3_session
 from dbt.adapters.contracts.connection import (
@@ -77,6 +78,7 @@ class AthenaCredentials(Credentials):
     s3_tmp_table_dir: Optional[str] = None
     # Unfortunately we can not just use dict, must be Dict because we'll get the following error:
     # Credentials in profile "athena", target "athena" invalid: Unable to create schema for 'dict'
+    query_timeout_seconds: Optional[int] = None
     seed_s3_upload_args: Optional[Dict[str, Any]] = None
     lf_tags_database: Optional[Dict[str, str]] = None
 
@@ -114,6 +116,7 @@ class AthenaCredentials(Credentials):
             "s3_data_naming",
             "s3_tmp_table_dir",
             "debug_query_state",
+            "query_timeout_seconds",
             "seed_s3_upload_args",
             "lf_tags_database",
             "spark_work_group",
@@ -122,6 +125,7 @@ class AthenaCredentials(Credentials):
 
 class AthenaCursor(Cursor):
     def __init__(self, **kwargs) -> None:
+        self._query_timeout_seconds: Optional[int] = kwargs.pop("query_timeout_seconds", None)
         super().__init__(**kwargs)
         self._executor = ThreadPoolExecutor()
 
@@ -148,6 +152,10 @@ class AthenaCursor(Cursor):
         return query_execution
 
     def __poll(self, query_id: str) -> AthenaQueryExecution:
+        query_timeout = self._query_timeout_seconds
+        if query_timeout is None:
+            query_timeout = self.connection.cursor_kwargs.get("query_timeout_seconds")
+        start_time = time.monotonic() if query_timeout else None
         while True:
             query_execution = self._get_query_execution(query_id)
             if query_execution.state in [
@@ -156,6 +164,15 @@ class AthenaCursor(Cursor):
                 AthenaQueryExecution.STATE_CANCELLED,
             ]:
                 return query_execution
+
+            if start_time is not None and (time.monotonic() - start_time) >= query_timeout:
+                LOGGER.warning(
+                    f"Query {query_id} exceeded timeout of {query_timeout}s. Cancelling..."
+                )
+                self._cancel(query_id)
+                raise AthenaQueryTimeoutError(
+                    f"Athena query {query_id} timed out after {query_timeout} seconds"
+                )
 
             if self.connection.cursor_kwargs.get("debug_query_state", False):
                 LOGGER.debug(
@@ -284,6 +301,7 @@ class AthenaConnectionManager(SQLConnectionManager):
                 cursor_kwargs={
                     "debug_query_state": creds.debug_query_state,
                     "num_iceberg_retries": creds.num_iceberg_retries,
+                    "query_timeout_seconds": creds.query_timeout_seconds,
                 },
                 formatter=AthenaParameterFormatter(),
                 poll_interval=creds.poll_interval,

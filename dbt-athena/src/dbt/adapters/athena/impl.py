@@ -4,6 +4,8 @@ import posixpath as path
 import re
 import struct
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
@@ -36,6 +38,7 @@ from dbt.adapters.athena.connections import AthenaCursor
 from dbt.adapters.athena.constants import LOGGER
 from dbt.adapters.athena.session import get_boto3_session_from_credentials
 from dbt.adapters.athena.exceptions import (
+    AthenaModelTimeoutError,
     S3LocationException,
     SnapshotMigrationRequired,
 )
@@ -128,6 +131,7 @@ class AthenaConfig(AdapterConfig):
     force_batch: bool = False
     unique_tmp_table_suffix: bool = False
     temp_schema: Optional[str] = None
+    model_timeout_seconds: Optional[int] = None
 
 
 class AthenaAdapter(SQLAdapter):
@@ -141,6 +145,29 @@ class AthenaAdapter(SQLAdapter):
     Column = AthenaColumn
 
     quote_character: str = '"'  # Presto quote character
+
+    _model_deadline: threading.local = threading.local()
+
+    @available
+    def set_model_timeout(self, timeout_seconds: Optional[int]) -> None:
+        if timeout_seconds is not None and timeout_seconds > 0:
+            self._model_deadline.value = time.monotonic() + timeout_seconds
+            LOGGER.debug(f"Model timeout set: {timeout_seconds}s from now")
+        else:
+            self._model_deadline.value = None
+
+    @available
+    def clear_model_timeout(self) -> None:
+        self._model_deadline.value = None
+
+    @available
+    def check_model_timeout(self) -> None:
+        deadline = getattr(self._model_deadline, "value", None)
+        if deadline is not None and time.monotonic() >= deadline:
+            self._model_deadline.value = None
+            raise AthenaModelTimeoutError(
+                "Model execution exceeded model_timeout_seconds"
+            )
 
     # There is no such concept as constraints in Athena
     CONSTRAINT_SUPPORT = {
@@ -1499,6 +1526,7 @@ class AthenaAdapter(SQLAdapter):
     @available
     def run_operation_with_potential_multiple_runs(self, query: str, op: str) -> None:
         while True:
+            self.check_model_timeout()
             try:
                 self._run_query(query, catch_partitions_limit=False)
                 break
@@ -1507,6 +1535,7 @@ class AthenaAdapter(SQLAdapter):
                     raise e
 
     def _run_query(self, sql: str, catch_partitions_limit: bool) -> AthenaCursor:
+        self.check_model_timeout()
         query = self.connections._add_query_comment(sql)
         conn = self.connections.get_thread_connection()
         cursor: AthenaCursor = conn.handle.cursor()
