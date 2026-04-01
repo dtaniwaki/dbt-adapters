@@ -9,9 +9,5 @@ class S3LocationException(DbtRuntimeError):
     pass
 
 
-class AthenaQueryTimeoutError(DbtRuntimeError):
-    pass
-
-
 class AthenaModelTimeoutError(DbtRuntimeError):
     pass
