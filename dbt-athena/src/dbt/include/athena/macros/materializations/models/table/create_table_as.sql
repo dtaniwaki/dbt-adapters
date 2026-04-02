@@ -171,6 +171,7 @@
     {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
 
     {%- for batch in partitions_batches -%}
+        {%- do adapter.check_model_timeout() -%}
         {%- do log('BATCH PROCESSING: ' ~ loop.index ~ ' OF ' ~ partitions_batches | length) -%}
 
         {%- if loop.index == 1 -%}
