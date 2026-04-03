@@ -6,7 +6,8 @@
   {%- set target_columns = adapter.get_columns_in_relation(target_relation) -%}
 
   {%- set merge_select_exclude_columns = config.get('merge_select_exclude_columns') -%}
-  {%- if merge_select_exclude_columns -%}
+  {%- set incremental_strategy = config.get('incremental_strategy') -%}
+  {%- if merge_select_exclude_columns and incremental_strategy == 'merge' -%}
     {%- set merge_select_exclude_lower = merge_select_exclude_columns | map("lower") | list -%}
     {%- set filtered_source_columns = [] -%}
     {%- for col in source_columns -%}
