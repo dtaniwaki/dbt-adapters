@@ -5,12 +5,12 @@
   {%- set source_columns = adapter.get_columns_in_relation(source_relation) -%}
   {%- set target_columns = adapter.get_columns_in_relation(target_relation) -%}
 
-  {%- set merge_exclude_columns = config.get('merge_exclude_columns') -%}
-  {%- if merge_exclude_columns -%}
-    {%- set merge_exclude_lower = merge_exclude_columns | map("lower") | list -%}
+  {%- set merge_select_exclude_columns = config.get('merge_select_exclude_columns') -%}
+  {%- if merge_select_exclude_columns -%}
+    {%- set merge_select_exclude_lower = merge_select_exclude_columns | map("lower") | list -%}
     {%- set filtered_source_columns = [] -%}
     {%- for col in source_columns -%}
-      {%- if col.column | lower not in merge_exclude_lower -%}
+      {%- if col.column | lower not in merge_select_exclude_lower -%}
         {%- do filtered_source_columns.append(col) -%}
       {%- endif -%}
     {%- endfor -%}
