@@ -72,19 +72,51 @@ execute_query(spark)
 {%- endmacro -%}
 
 {%- macro athena__py_get_spark_dbt_object() -%}
+{#-
+  Cross-account GLUE catalogs registered in Athena are resolved at compile
+  time so that Spark Python models can transparently reference them via
+  dbt.source() / dbt.ref() without hard-coding account IDs.
+
+  The mapping is injected as a Python dict. When combined with the
+  `spark_cross_account_catalog` profile option (which sets
+  `spark.hadoop.aws.glue.catalog.separator` to `/`), Spark can resolve
+  `<account_id>/<schema>.<table>` identifiers against a remote Glue catalog.
+-#}
+{%- set cross_account_catalogs = adapter.get_spark_cross_account_catalog_map() -%}
+_CROSS_ACCOUNT_CATALOGS = {{ cross_account_catalogs | tojson }}
+
 def get_spark_df(identifier):
     """
-    Override the arguments to ref and source dynamically
+    Override the arguments to ref and source dynamically.
 
-    spark.table('awsdatacatalog.analytics_dev.model')
-    Raises pyspark.sql.utils.AnalysisException:
-    spark_catalog requires a single-part namespace,
-    but got [awsdatacatalog, analytics_dev]
+    dbt passes a fully-qualified identifier like
+    '"awsdatacatalog"."analytics_dev"."model"'.
 
-    So the override removes the catalog component and only
-    provides the schema and identifer to spark.table()
+    spark.table('awsdatacatalog.analytics_dev.model') raises
+    pyspark.sql.utils.AnalysisException:
+      spark_catalog requires a single-part namespace,
+      but got [awsdatacatalog, analytics_dev]
+
+    For local catalog (`awsdatacatalog`) references we therefore strip the
+    catalog component and call spark.table('schema.table').
+
+    For cross-account GLUE catalogs registered in Athena, we translate the
+    catalog name to the corresponding AWS account ID (resolved at compile
+    time by the adapter) and emit 'account_id/schema.table' — which Spark's
+    Glue Catalog Client can resolve when the
+    `spark.hadoop.aws.glue.catalog.separator` property is set to '/'
+    (enabled via the `spark_cross_account_catalog` profile option).
     """
-    return spark.table(".".join(identifier.split(".")[1:]).replace('"', ''))
+    parts = identifier.replace('"', '').split(".")
+    if len(parts) < 3:
+        return spark.table(identifier.replace('"', ''))
+    catalog, schema, table = parts[0], parts[1], parts[2]
+    if catalog.lower() == "awsdatacatalog":
+        return spark.table(f"{schema}.{table}")
+    account_id = _CROSS_ACCOUNT_CATALOGS.get(catalog)
+    if account_id is None:
+        return spark.table(f"{schema}.{table}")
+    return spark.table(f"{account_id}/{schema}.{table}")
 
 class SparkdbtObj(dbtObj):
     def __init__(self):
