@@ -55,6 +55,7 @@
     existing_relation,
     force_batch,
     disable_batch_fallback=False,
+    source_sql=none,
     statement_name="main"
   )
 %}
@@ -67,18 +68,34 @@
     {% if force_batch %}
         {% do batch_incremental_insert(tmp_relation, target_relation, dest_cols_csv) %}
     {% else %}
-      {%- set insert_full -%}
-          insert into {{ target_relation }} ({{ dest_cols_csv }})
-              (
-                 select {{ dest_cols_csv }}
-                 from {{ tmp_relation }}
-              );
-      {%- endset -%}
+      {%- if source_sql is not none -%}
+        {%- set insert_full -%}
+            insert into {{ target_relation }} ({{ dest_cols_csv }})
+                (
+                   select {{ dest_cols_csv }}
+                   from (
+                     {{ source_sql }}
+                   ) _dbt_sbq
+                );
+        {%- endset -%}
+      {%- else -%}
+        {%- set insert_full -%}
+            insert into {{ target_relation }} ({{ dest_cols_csv }})
+                (
+                   select {{ dest_cols_csv }}
+                   from {{ tmp_relation }}
+                );
+        {%- endset -%}
+      {%- endif -%}
 
       {%- set query_result =  adapter.run_query_with_partitions_limit_catching(insert_full, disable_batch_fallback) -%}
       {%- do log('QUERY RESULT: ' ~ query_result) -%}
       {%- if query_result == 'TOO_MANY_OPEN_PARTITIONS' -%}
+        {%- if source_sql is not none -%}
+          {% do exceptions.raise_compiler_error('Runtime error: TOO_MANY_OPEN_PARTITIONS encountered with build_with_subquery=True. Disable build_with_subquery to enable automatic batching.') %}
+        {%- else -%}
           {% do batch_incremental_insert(tmp_relation, target_relation, dest_cols_csv) %}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
 

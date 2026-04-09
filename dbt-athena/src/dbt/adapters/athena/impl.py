@@ -110,6 +110,9 @@ class AthenaConfig(AdapterConfig):
             falling back to batch mode.
         unique_tmp_table_suffix: Enforce the use of a unique id as tmp table suffix instead of __dbt_tmp.
         temp_schema: Define in which schema to create temporary tables used in incremental runs.
+        build_with_subquery: Use a subquery directly instead of staging data into __dbt_tmp.
+            Creates an empty tmp table (WITH NO DATA) for schema comparison, then applies via subquery.
+            Supported for Iceberg merge and append strategies, and Hive append. Incompatible with force_batch.
     """
 
     work_group: Optional[str] = None
@@ -135,6 +138,7 @@ class AthenaConfig(AdapterConfig):
     unique_tmp_table_suffix: bool = False
     temp_schema: Optional[str] = None
     model_timeout_seconds: Optional[int] = None
+    build_with_subquery: bool = False
 
 
 class AthenaAdapter(SQLAdapter):
