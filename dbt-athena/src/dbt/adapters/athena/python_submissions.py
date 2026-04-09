@@ -173,9 +173,11 @@ class AthenaPythonJobHelper(PythonJobHelper):
             )
             if execution_status == "COMPLETED":
                 try:
-                    result = self.athena_client.get_calculation_execution(
+                    execution = self.athena_client.get_calculation_execution(
                         CalculationExecutionId=calculation_execution_id
-                    )["Result"]
+                    )
+                    result = execution["Result"]
+                    result["Statistics"] = execution.get("Statistics", {})
                 except Exception as e:
                     LOGGER.error(f"Unable to retrieve results: Got: {e}")
                     result = {}

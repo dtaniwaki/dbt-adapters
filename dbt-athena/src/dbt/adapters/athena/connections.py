@@ -48,6 +48,7 @@ from dbt.adapters.sql import SQLConnectionManager
 @dataclass
 class AthenaAdapterResponse(AdapterResponse):
     data_scanned_in_bytes: Optional[int] = None
+    dpu_execution_in_millis: Optional[int] = None
 
 
 @dataclass

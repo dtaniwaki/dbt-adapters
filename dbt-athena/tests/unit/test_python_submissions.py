@@ -224,7 +224,9 @@ class TestAthenaPythonJobHelper:
                     athena_job_helper, poll_until_session_idle=Mock(return_value="IDLE")
                 ):
                     result = athena_job_helper.submit("hello world")
-                    assert result == test_calculation_execution["Result"]
+                    expected = dict(test_calculation_execution["Result"])
+                    expected["Statistics"] = test_calculation_execution.get("Statistics", {})
+                    assert result == expected
 
 
 class TestSessionStateErrorHandling:
@@ -333,7 +335,7 @@ class TestSessionStateErrorHandling:
                 first_session_id
             )
             # Verify we got a result (meaning retry worked)
-            assert result == {"ResultS3Uri": "test_results_s3_uri"}
+            assert result == {"ResultS3Uri": "test_results_s3_uri", "Statistics": {}}
             # Verify we made two attempts
             assert start_calc_calls[0] == 2
 
@@ -413,6 +415,6 @@ class TestSessionStateErrorHandling:
             result = helper.submit("print('hello')")
 
             # Verify we got a result
-            assert result == {"ResultS3Uri": "test_results_s3_uri"}
+            assert result == {"ResultS3Uri": "test_results_s3_uri", "Statistics": {}}
             # Verify we made two attempts (once failed with BUSY, then succeeded)
             assert call_count[0] == 2
