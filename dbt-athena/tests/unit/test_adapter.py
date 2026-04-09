@@ -15,6 +15,8 @@ from moto import mock_aws
 from moto.core import DEFAULT_ACCOUNT_ID
 from mypy_boto3_glue.client import GlueClient
 
+from pyathena.error import OperationalError
+
 from dbt.adapters.athena import AthenaAdapter
 from dbt.adapters.athena import Plugin as AthenaPlugin
 from dbt.adapters.athena.column import AthenaColumn
@@ -1435,6 +1437,74 @@ class TestAthenaAdapter:
         self.adapter.acquire_connection("dummy")
         self.adapter.drop_glue_database(database_name=test_input["Name"])
         assert glue_client.get_databases()["DatabaseList"] == []
+
+
+class TestRunQueryWithPartitionsLimitCatching:
+    def setup_method(self, _):
+        project_cfg = {
+            "name": "X",
+            "version": "0.1",
+            "profile": "test",
+            "project-root": "/tmp/dbt/does-not-exist",
+            "config-version": 2,
+        }
+        profile_cfg = {
+            "outputs": {
+                "test": {
+                    "type": "athena",
+                    "s3_staging_dir": S3_STAGING_DIR,
+                    "region_name": AWS_REGION,
+                    "database": DATA_CATALOG_NAME,
+                    "work_group": ATHENA_WORKGROUP,
+                    "schema": DATABASE_NAME,
+                }
+            },
+            "target": "test",
+        }
+        config = config_from_parts_or_dicts(project_cfg, profile_cfg)
+        self.adapter = AthenaAdapter(config, get_context("spawn"))
+        inject_adapter(self.adapter, AthenaPlugin)
+
+    def test_default_fallback_returns_string(self):
+        with mock.patch.object(
+            self.adapter,
+            "_run_query",
+            side_effect=OperationalError("TOO_MANY_OPEN_PARTITIONS"),
+        ):
+            result = self.adapter.run_query_with_partitions_limit_catching(
+                "SELECT 1", disable_batch_fallback=False
+            )
+            assert result == "TOO_MANY_OPEN_PARTITIONS"
+
+    def test_disable_batch_fallback_raises_error(self):
+        with mock.patch.object(
+            self.adapter,
+            "_run_query",
+            side_effect=OperationalError("TOO_MANY_OPEN_PARTITIONS"),
+        ):
+            with pytest.raises(OperationalError, match="TOO_MANY_OPEN_PARTITIONS"):
+                self.adapter.run_query_with_partitions_limit_catching(
+                    "SELECT 1", disable_batch_fallback=True
+                )
+
+    def test_other_errors_always_raise(self):
+        with mock.patch.object(
+            self.adapter,
+            "_run_query",
+            side_effect=OperationalError("SOME_OTHER_ERROR"),
+        ):
+            with pytest.raises(OperationalError, match="SOME_OTHER_ERROR"):
+                self.adapter.run_query_with_partitions_limit_catching(
+                    "SELECT 1", disable_batch_fallback=False
+                )
+
+    def test_success_returns_json(self):
+        mock_cursor = mock.Mock()
+        mock_cursor.rowcount = 10
+        mock_cursor.data_scanned_in_bytes = 1024
+        with mock.patch.object(self.adapter, "_run_query", return_value=mock_cursor):
+            result = self.adapter.run_query_with_partitions_limit_catching("SELECT 1")
+            assert result == '{"rowcount":10,"data_scanned_in_bytes":1024}'
 
 
 class TestAthenaFilterCatalog:
