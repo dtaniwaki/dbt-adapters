@@ -110,13 +110,17 @@ def get_spark_df(identifier):
 
     For cross-account GLUE catalogs registered in Athena, we translate the
     catalog name to the corresponding AWS account ID (resolved at compile
-    time by the adapter) and emit 'account_id/schema.table' — which Spark's
-    Glue Catalog Client can resolve when the
+    time by the adapter) and emit '`account_id/schema`.table' — which
+    Spark's Glue Catalog Client can resolve when the
     `spark.hadoop.aws.glue.catalog.separator` property is set to '/'. That
     property is set automatically by `AthenaSparkSessionConfig` when the
     model opts in with `spark_cross_account_catalog: true`; when the model
     does not opt in, `_CROSS_ACCOUNT_CATALOGS` is empty and we fall back to
     the legacy two-part form.
+
+    The backtick quoting around `account_id/schema` is required because
+    `spark.table()` internally parses the name as a SQL identifier, and `/`
+    is not valid in an unquoted identifier.
     """
     parts = identifier.replace('"', '').split(".")
     if len(parts) < 3:
@@ -127,7 +131,7 @@ def get_spark_df(identifier):
     account_id = _CROSS_ACCOUNT_CATALOGS.get(catalog)
     if account_id is None:
         return spark.table(f"{schema}.{table}")
-    return spark.table(f"{account_id}/{schema}.{table}")
+    return spark.table(f"`{account_id}/{schema}`.{table}")
 
 class SparkdbtObj(dbtObj):
     def __init__(self):
