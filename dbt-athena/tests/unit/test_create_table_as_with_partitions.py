@@ -45,7 +45,7 @@ class MockColumn:
         self.quoted = f'"{name}"'
 
 
-def _render_macro(batches, columns=None, temporary=False):
+def _render_macro(batches, columns=None, temporary=False, partitioned_by=None):
     """Render create_table_as_with_partitions with stubbed context.
 
     Args:
@@ -53,6 +53,8 @@ def _render_macro(batches, columns=None, temporary=False):
                  Pass an empty list to simulate a zero-row source query.
         columns: List of MockColumn objects for adapter.get_columns_in_relation.
         temporary: Value for the ``temporary`` parameter.
+        partitioned_by: Value returned by ``config.get('partitioned_by')``.
+                        ``None`` exercises the unpartitioned branch.
 
     Returns:
         List of SQL strings passed to run_query, in call order.
@@ -82,6 +84,13 @@ def _render_macro(batches, columns=None, temporary=False):
     api = mock.Mock()
     api.Relation.create = mock.Mock(return_value=tmp_relation)
 
+    config_values = {"partitioned_by": partitioned_by}
+
+    def config_get(key, *args, **kwargs):
+        if key in config_values:
+            return config_values[key]
+        return kwargs.get("default", args[0] if args else None)
+
     context = {
         "api": api,
         "adapter": adapter,
@@ -93,7 +102,7 @@ def _render_macro(batches, columns=None, temporary=False):
         "get_partition_batches": lambda **kwargs: batches,
         "exceptions": mock.Mock(),
     }
-    context["config"].get = lambda key, *args, **kwargs: kwargs.get("default", args[0] if args else None)
+    context["config"].get = config_get
 
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(_TABLE_DIR),
@@ -106,23 +115,26 @@ def _render_macro(batches, columns=None, temporary=False):
     return run_query_calls
 
 
+_PARTITIONED_BY = ["date_col"]
+
+
 class TestEmptyBatches:
     """When the source data is empty, get_partition_batches returns [].
     The macro must still create the target table so post-hooks don't fail."""
 
     def test_run_query_called_twice(self):
         """run_query is called once for staging CREATE and once for empty target CREATE."""
-        calls = _render_macro(batches=[])
+        calls = _render_macro(batches=[], partitioned_by=_PARTITIONED_BY)
         assert len(calls) == 2
 
     def test_staging_table_created_first(self):
         """First run_query call creates the staging (tmp) table."""
-        calls = _render_macro(batches=[])
+        calls = _render_macro(batches=[], partitioned_by=_PARTITIONED_BY)
         assert "my_table__tmp_not_partitioned" in calls[0]
 
     def test_target_table_created_from_staging(self):
         """Second run_query call creates the target table by selecting all rows from staging."""
-        calls = _render_macro(batches=[])
+        calls = _render_macro(batches=[], partitioned_by=_PARTITIONED_BY)
         target_sql = calls[1]
         assert "my_table__tmp_not_partitioned" in target_sql
         # Empty CTAS: no WHERE clause
@@ -130,7 +142,11 @@ class TestEmptyBatches:
 
     def test_target_table_uses_correct_columns(self):
         """The empty CTAS selects the columns returned by get_columns_in_relation."""
-        calls = _render_macro(batches=[], columns=[MockColumn("a"), MockColumn("b")])
+        calls = _render_macro(
+            batches=[],
+            columns=[MockColumn("a"), MockColumn("b")],
+            partitioned_by=_PARTITIONED_BY,
+        )
         target_sql = calls[1]
         assert '"a"' in target_sql
         assert '"b"' in target_sql
@@ -140,12 +156,15 @@ class TestSingleBatch:
     """With one partition batch, the target table is created via CTAS with a WHERE clause."""
 
     def test_run_query_called_twice(self):
-        calls = _render_macro(batches=['"date_col"=DATE\'2024-01-01\''])
+        calls = _render_macro(
+            batches=['"date_col"=DATE\'2024-01-01\''],
+            partitioned_by=_PARTITIONED_BY,
+        )
         assert len(calls) == 2
 
     def test_target_table_uses_where_clause(self):
         batch = '"date_col"=DATE\'2024-01-01\''
-        calls = _render_macro(batches=[batch])
+        calls = _render_macro(batches=[batch], partitioned_by=_PARTITIONED_BY)
         target_sql = calls[1]
         assert "WHERE" in target_sql.upper()
         assert batch in target_sql
@@ -161,17 +180,37 @@ class TestMultipleBatches:
             '"date_col"=DATE\'2024-01-02\'',
             '"date_col"=DATE\'2024-01-03\'',
         ]
-        calls = _render_macro(batches=batches)
+        calls = _render_macro(batches=batches, partitioned_by=_PARTITIONED_BY)
         assert len(calls) == len(batches) + 1
 
     def test_first_batch_creates_table(self):
         batches = ['"date_col"=DATE\'2024-01-01\'', '"date_col"=DATE\'2024-01-02\'']
-        calls = _render_macro(batches=batches)
+        calls = _render_macro(batches=batches, partitioned_by=_PARTITIONED_BY)
         # calls[0] = staging CREATE, calls[1] = first batch CREATE TABLE
         assert "CREATE TABLE" in calls[1].upper()
 
     def test_subsequent_batches_use_insert(self):
         batches = ['"date_col"=DATE\'2024-01-01\'', '"date_col"=DATE\'2024-01-02\'']
-        calls = _render_macro(batches=batches)
+        calls = _render_macro(batches=batches, partitioned_by=_PARTITIONED_BY)
         # calls[2] = second batch INSERT
         assert "INSERT INTO" in calls[2].upper()
+
+
+class TestUnpartitionedModel:
+    """When partitioned_by is None, the macro creates a single target table
+    from the staging table without invoking the batch/empty-batch logic."""
+
+    def test_single_target_create_without_batches(self):
+        calls = _render_macro(batches=[])
+        # 1 staging CREATE + 1 target CREATE (no empty-batch fallback)
+        assert len(calls) == 2
+        assert "my_table__tmp_not_partitioned" in calls[0]
+        assert "my_table__tmp_not_partitioned" in calls[1]
+        assert "WHERE" not in calls[1].upper()
+
+    def test_batches_ignored_when_unpartitioned(self):
+        """Even if get_partition_batches returns values, they must not be used."""
+        batches = ['"date_col"=DATE\'2024-01-01\'', '"date_col"=DATE\'2024-01-02\'']
+        calls = _render_macro(batches=batches)
+        assert len(calls) == 2
+        assert "INSERT INTO" not in " ".join(calls).upper()
