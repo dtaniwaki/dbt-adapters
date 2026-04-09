@@ -77,12 +77,20 @@ execute_query(spark)
   time so that Spark Python models can transparently reference them via
   dbt.source() / dbt.ref() without hard-coding account IDs.
 
-  The mapping is injected as a Python dict. When combined with the
-  `spark_cross_account_catalog` profile option (which sets
-  `spark.hadoop.aws.glue.catalog.separator` to `/`), Spark can resolve
-  `<account_id>/<schema>.<table>` identifiers against a remote Glue catalog.
+  The mapping is injected as a Python dict only when the model has
+  `spark_cross_account_catalog: true`. That config causes
+  `AthenaSparkSessionConfig` to set `spark.hadoop.aws.glue.catalog.separator`
+  to `/` on the Spark session, which is the only form Spark can parse for
+  `<account_id>/<schema>.<table>` identifiers. Populating the map without
+  enabling the config would emit identifiers the Spark parser rejects, so
+  models that do not opt in receive an empty mapping and fall back to the
+  legacy `<schema>.<table>` form (local catalog behavior, unchanged).
 -#}
-{%- set cross_account_catalogs = adapter.get_spark_cross_account_catalog_map() -%}
+{%- if config.get("spark_cross_account_catalog", false) -%}
+  {%- set cross_account_catalogs = adapter.get_spark_cross_account_catalog_map() -%}
+{%- else -%}
+  {%- set cross_account_catalogs = {} -%}
+{%- endif -%}
 _CROSS_ACCOUNT_CATALOGS = {{ cross_account_catalogs | tojson }}
 
 def get_spark_df(identifier):
@@ -104,8 +112,11 @@ def get_spark_df(identifier):
     catalog name to the corresponding AWS account ID (resolved at compile
     time by the adapter) and emit 'account_id/schema.table' — which Spark's
     Glue Catalog Client can resolve when the
-    `spark.hadoop.aws.glue.catalog.separator` property is set to '/'
-    (enabled via the `spark_cross_account_catalog` profile option).
+    `spark.hadoop.aws.glue.catalog.separator` property is set to '/'. That
+    property is set automatically by `AthenaSparkSessionConfig` when the
+    model opts in with `spark_cross_account_catalog: true`; when the model
+    does not opt in, `_CROSS_ACCOUNT_CATALOGS` is empty and we fall back to
+    the legacy two-part form.
     """
     parts = identifier.replace('"', '').split(".")
     if len(parts) < 3:
