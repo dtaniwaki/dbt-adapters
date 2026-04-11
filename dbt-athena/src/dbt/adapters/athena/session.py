@@ -126,6 +126,7 @@ class AthenaSparkSessionManager:
         polling_interval: float,
         engine_config: Dict[str, int],
         relation_name: str = "N/A",
+        spark_managed_logging: bool = False,
     ) -> None:
         """
         Initialize the AthenaSparkSessionManager instance.
@@ -135,6 +136,7 @@ class AthenaSparkSessionManager:
             timeout (int): The timeout value in seconds.
             polling_interval (float): The polling interval in seconds.
             engine_config (Dict[str, int]): The engine configuration.
+            spark_managed_logging (bool): Enable managed logging for Spark UI (requires PySpark 3.5+).
 
         """
         self.credentials = credentials
@@ -143,6 +145,7 @@ class AthenaSparkSessionManager:
         self.engine_config = engine_config
         self.lock = threading.Lock()
         self.relation_name = relation_name
+        self.spark_managed_logging = spark_managed_logging
 
     @cached_property
     def spark_threads(self) -> int:
@@ -257,12 +260,17 @@ class AthenaSparkSessionManager:
 
         """
         description = self.session_description
-        response = self.athena_client.start_session(
-            Description=description,
-            WorkGroup=self.credentials.spark_work_group,
-            EngineConfiguration=self.engine_config,
-            SessionIdleTimeoutInMinutes=SESSION_IDLE_TIMEOUT_MIN,
-        )
+        kwargs: Dict[str, Any] = {
+            "Description": description,
+            "WorkGroup": self.credentials.spark_work_group,
+            "EngineConfiguration": self.engine_config,
+            "SessionIdleTimeoutInMinutes": SESSION_IDLE_TIMEOUT_MIN,
+        }
+        if self.spark_managed_logging:
+            kwargs["MonitoringConfiguration"] = {
+                "ManagedLoggingConfiguration": {"Enabled": True}
+            }
+        response = self.athena_client.start_session(**kwargs)
         session_id = response["SessionId"]
         if response["State"] != "IDLE":
             self.poll_until_session_creation(session_id)

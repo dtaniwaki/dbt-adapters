@@ -42,6 +42,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
             self.polling_interval,
             self.engine_config,
             self.relation_name,
+            spark_managed_logging=self.config.config.get("spark_managed_logging", False),
         )
 
     @cached_property
