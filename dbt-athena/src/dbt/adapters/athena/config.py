@@ -129,12 +129,19 @@ class AthenaSparkSessionConfig:
             ),
         )
 
-        default_engine_config = {
+        default_engine_config: Dict[str, Any] = {
             "CoordinatorDpuSize": DEFAULT_SPARK_COORDINATOR_DPU_SIZE,
             "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
             "DefaultExecutorDpuSize": DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
             "SparkProperties": default_spark_properties,
         }
+        # Apache Spark version 3.5+ does not support CoordinatorDpuSize
+        # and DefaultExecutorDpuSize. Remove them when spark_engine_version
+        # is set to "3.5".
+        spark_engine_version = self.config.get("spark_engine_version", None)
+        if spark_engine_version == "3.5":
+            default_engine_config.pop("CoordinatorDpuSize", None)
+            default_engine_config.pop("DefaultExecutorDpuSize", None)
         engine_config = self.config.get("engine_config", None)
 
         if engine_config:
