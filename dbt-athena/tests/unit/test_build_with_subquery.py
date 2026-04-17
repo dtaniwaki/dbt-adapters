@@ -338,64 +338,6 @@ class TestEmptySqlSubqueryWrapping:
             _assert_sql_equal(rendered, expected)
 
 
-# --- insert_full SQL pattern in create_table_as_with_subquery ---
-
-
-def _render_table_insert_full(compiled_code):
-    """Render the `{% set insert_full ... %}` Jinja expression from create_table_as.sql.
-    This tests the SQL pattern used for INSERT FROM subquery in table materialization."""
-    with open(_CREATE_TABLE_AS_SQL_PATH) as f:
-        src = f.read()
-    matches = re.findall(
-        r"\{%-?\s*set\s+insert_full\s*-?%\}(.*?)\{%-?\s*endset\s*-?%\}",
-        src,
-        flags=re.DOTALL,
-    )
-    assert matches, "expected at least one `{% set insert_full %}...{% endset %}` in create_table_as.sql"
-    rendered = []
-    env = jinja2.Environment(extensions=["jinja2.ext.do"])
-    for body in matches:
-        template_src = body
-        result = env.from_string(template_src).render(
-            relation=MockRelation("db.schema.tbl"),
-            dest_cols_csv='"id", "msg", "color"',
-            compiled_code=compiled_code,
-        )
-        rendered.append(result.strip())
-    return rendered
-
-
-class TestTableInsertFullSubquery:
-    def test_insert_uses_subquery(self):
-        renderings = _render_table_insert_full("SELECT id, msg, color FROM src")
-        assert renderings, "no insert_full fragments rendered"
-        expected = """\
-            insert into db.schema.tbl ("id", "msg", "color")
-                (
-                    select "id", "msg", "color"
-                    from (
-                        SELECT id, msg, color FROM src
-                    ) _dbt_sbq
-                );"""
-        for rendered in renderings:
-            _assert_sql_equal(rendered, expected)
-
-    def test_insert_subquery_isolates_trailing_line_comment(self):
-        source_sql = "SELECT id, msg, color FROM src -- trailing comment"
-        renderings = _render_table_insert_full(source_sql)
-        assert renderings, "no insert_full fragments rendered"
-        expected = """\
-            insert into db.schema.tbl ("id", "msg", "color")
-                (
-                    select "id", "msg", "color"
-                    from (
-                        SELECT id, msg, color FROM src -- trailing comment
-                    ) _dbt_sbq
-                );"""
-        for rendered in renderings:
-            _assert_sql_equal(rendered, expected)
-
-
 # --- empty_sql in create_table_as.sql ---
 
 

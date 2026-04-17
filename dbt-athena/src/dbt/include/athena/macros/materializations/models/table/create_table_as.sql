@@ -202,27 +202,21 @@
 
 {% macro create_table_as_with_subquery(temporary, relation, compiled_code) -%}
 
-    {%- do log('CREATE EMPTY TABLE WITH SUBQUERY SCHEMA: ' ~ relation) -%}
-    {%- set empty_sql = 'SELECT * FROM (\n' ~ compiled_code ~ '\n) _dbt_sbq WITH NO DATA' -%}
-    {%- do run_query(create_table_as(temporary, relation, empty_sql)) -%}
-
-    {%- set dest_columns = adapter.get_columns_in_relation(relation) -%}
-    {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
-
-    {%- set insert_full -%}
-        insert into {{ relation }} ({{ dest_cols_csv }})
-            (
-               select {{ dest_cols_csv }}
-               from (
-                 {{ compiled_code }}
-               ) _dbt_sbq
-            );
-    {%- endset -%}
-
-    {%- set query_result = adapter.run_query_with_partitions_limit_catching(insert_full) -%}
+    {%- do log('CREATE TABLE WITH SUBQUERY (CTAS): ' ~ relation) -%}
+    {%- set query_result = adapter.run_query_with_partitions_limit_catching(create_table_as(temporary, relation, compiled_code)) -%}
     {%- do log('QUERY RESULT: ' ~ query_result) -%}
+
     {%- if query_result == 'TOO_MANY_OPEN_PARTITIONS' -%}
         {%- do log('TOO_MANY_OPEN_PARTITIONS: falling back to batch insert with subquery') -%}
+
+        {%- do drop_relation(relation) -%}
+
+        {%- set empty_sql = 'SELECT * FROM (\n' ~ compiled_code ~ '\n) _dbt_sbq WITH NO DATA' -%}
+        {%- do run_query(create_table_as(temporary, relation, empty_sql)) -%}
+
+        {%- set dest_columns = adapter.get_columns_in_relation(relation) -%}
+        {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
+
         {%- set partitions_batches = get_partition_batches(sql=compiled_code, as_subquery=True) -%}
         {%- do log('BATCHES TO PROCESS: ' ~ partitions_batches | length) -%}
 
