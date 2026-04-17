@@ -68,7 +68,7 @@
 
   -- Relation doesn't exist, do full build --
   {% if existing_relation is none %}
-    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch) -%}
+    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch, build_with_subquery) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -103,7 +103,7 @@
     {%- endif -%}
 
     -- create the full refresh version of the incremental iceberg table
-    {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, model_language, force_batch) -%}
+    {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, model_language, force_batch, build_with_subquery) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
@@ -131,7 +131,7 @@
   -- Running in full refresh, drop existing relation, and do full build --
   {% elif existing_relation.is_view or should_full_refresh() %}
     {% do drop_relation(existing_relation) %}
-    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch) -%}
+    {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch, build_with_subquery) -%}
     {%- if model_language == 'python' -%}
       {% call statement('create_table', language=model_language) %}
         {{ query_result }}
