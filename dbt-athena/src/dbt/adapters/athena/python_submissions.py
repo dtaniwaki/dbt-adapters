@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from functools import cached_property
@@ -17,9 +18,27 @@ SUBMISSION_LANGUAGE = "python"
 # Minimum remaining token lifetime before refreshing (seconds).
 _TOKEN_REFRESH_MARGIN_SECONDS = 120
 
+_spark_connect_env_lock = threading.Lock()
+_spark_connect_env_set = False
+
+
+def _ensure_spark_connect_env() -> None:
+    """Set SPARK_CONNECT_MODE_ENABLED=1 once for the process."""
+    global _spark_connect_env_set
+    if _spark_connect_env_set:
+        return
+    with _spark_connect_env_lock:
+        if not _spark_connect_env_set:
+            os.environ["SPARK_CONNECT_MODE_ENABLED"] = "1"
+            _spark_connect_env_set = True
+
 
 def _create_athena_channel_builder(
-    athena_client: Any, session_id: str, endpoint_url: str
+    athena_client: Any,
+    session_id: str,
+    endpoint_url: str,
+    initial_auth_token: str | None = None,
+    initial_token_expiry: Any = None,
 ) -> Any:
     """Create a ChannelBuilder subclass that auto-refreshes the Athena AuthToken.
 
@@ -36,13 +55,13 @@ def _create_athena_channel_builder(
     from pyspark.sql.connect.client.core import ChannelBuilder
 
     class AthenaChannelBuilder(ChannelBuilder):
-        def __init__(self, client: Any, sid: str, url: str):
+        def __init__(self, client: Any, sid: str, url: str, auth_token: str | None, token_expiry: Any):
             sc_url = url.replace("https://", "sc://", 1) + ":443/;use_ssl=true"
             super().__init__(sc_url)
             self._athena_client = client
             self._athena_session_id = sid
-            self._auth_token: str | None = None
-            self._token_expiry: datetime | None = None
+            self._auth_token = auth_token
+            self._token_expiry = token_expiry
 
         def _refresh_token_if_needed(self) -> None:
             if self._auth_token and self._token_expiry:
@@ -68,7 +87,7 @@ def _create_athena_channel_builder(
             base.append(("x-aws-proxy-auth", self._auth_token))
             return base
 
-    return AthenaChannelBuilder(athena_client, session_id, endpoint_url)
+    return AthenaChannelBuilder(athena_client, session_id, endpoint_url, initial_auth_token, initial_token_expiry)
 
 
 class AthenaPythonJobHelper(PythonJobHelper):
@@ -174,8 +193,8 @@ class AthenaPythonJobHelper(PythonJobHelper):
             return self._submit_spark_connect(compiled_code)
         return self._submit_calculation_api(compiled_code)
 
-    def _wait_for_endpoint(self) -> str:
-        """Poll until the session endpoint is ready and return the endpoint URL."""
+    def _wait_for_endpoint(self) -> Dict[str, Any]:
+        """Poll until the session endpoint is ready and return the full response."""
         import random
 
         polling_interval = self.polling_interval
@@ -192,7 +211,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
                         raise DbtRuntimeError(
                             f"GetSessionEndpoint returned no AuthToken for session {self.session_id}"
                         )
-                    return endpoint_url
+                    return response
                 throttle_backoff = 0
             except botocore.exceptions.ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code", "")
@@ -217,29 +236,35 @@ class AthenaPythonJobHelper(PythonJobHelper):
 
         Uses AthenaChannelBuilder to auto-refresh the AuthToken before
         it expires (~29 min TTL), enabling long-running jobs.
-        Enforces self.timeout as a hard execution time limit.
+        Enforces self.timeout as a hard execution time limit covering both
+        endpoint wait and code execution.
         """
         if not compiled_code.strip():
             return {}
 
-        import os
-
-        prev_connect_mode = os.environ.get("SPARK_CONNECT_MODE_ENABLED")
-        os.environ["SPARK_CONNECT_MODE_ENABLED"] = "1"
+        _ensure_spark_connect_env()
 
         spark = None
         timer = None
         timeout_event = threading.Event()
+        start_time = time.monotonic()
 
         try:
-            endpoint_url = self._wait_for_endpoint()
+            response = self._wait_for_endpoint()
             channel_builder = _create_athena_channel_builder(
-                self.athena_client, self.session_id, endpoint_url
+                self.athena_client,
+                self.session_id,
+                response["EndpointUrl"],
+                initial_auth_token=response.get("AuthToken"),
+                initial_token_expiry=response.get("AuthTokenExpirationTime"),
             )
 
             from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
 
             spark = ConnectSparkSession.builder.channelBuilder(channel_builder).create()
+
+            elapsed = time.monotonic() - start_time
+            remaining = max(self.timeout - elapsed, 0)
 
             def _on_timeout():
                 timeout_event.set()
@@ -248,7 +273,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
                 )
                 spark.interruptAll()
 
-            timer = threading.Timer(self.timeout, _on_timeout)
+            timer = threading.Timer(remaining, _on_timeout)
             timer.start()
 
             exec_globals = {"spark": spark}
@@ -269,10 +294,6 @@ class AthenaPythonJobHelper(PythonJobHelper):
             if spark is not None:
                 spark.stop()
             self.spark_connection.set_spark_session_load(self.session_id, -1)
-            if prev_connect_mode is None:
-                os.environ.pop("SPARK_CONNECT_MODE_ENABLED", None)
-            else:
-                os.environ["SPARK_CONNECT_MODE_ENABLED"] = prev_connect_mode
 
         return {}
 
