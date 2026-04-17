@@ -222,7 +222,22 @@
     {%- set query_result = adapter.run_query_with_partitions_limit_catching(insert_full) -%}
     {%- do log('QUERY RESULT: ' ~ query_result) -%}
     {%- if query_result == 'TOO_MANY_OPEN_PARTITIONS' -%}
-        {%- do exceptions.raise_compiler_error('Runtime error: TOO_MANY_OPEN_PARTITIONS encountered with build_with_subquery=True. Disable build_with_subquery to enable automatic batching.') -%}
+        {%- do log('TOO_MANY_OPEN_PARTITIONS: falling back to batch insert with subquery') -%}
+        {%- set partitions_batches = get_partition_batches(sql=compiled_code, as_subquery=True) -%}
+        {%- do log('BATCHES TO PROCESS: ' ~ partitions_batches | length) -%}
+
+        {%- for batch in partitions_batches -%}
+            {%- do log('BATCH PROCESSING: ' ~ loop.index ~ ' OF ' ~ partitions_batches | length) -%}
+            {%- set insert_batch_sql -%}
+                insert into {{ relation }} ({{ dest_cols_csv }})
+                    select {{ dest_cols_csv }}
+                    from (
+                      {{ compiled_code }}
+                    ) _dbt_sbq
+                    where {{ batch }};
+            {%- endset -%}
+            {%- do run_query(insert_batch_sql) -%}
+        {%- endfor -%}
     {%- endif -%}
 
     select 'SUCCESSFULLY CREATED TABLE {{ relation }} with subquery'
