@@ -129,21 +129,41 @@ class AthenaSparkSessionConfig:
             ),
         )
 
-        default_engine_config = {
-            "CoordinatorDpuSize": DEFAULT_SPARK_COORDINATOR_DPU_SIZE,
+        # Apache Spark 3.5+ does not support CoordinatorDpuSize,
+        # DefaultExecutorDpuSize, and SparkProperties in EngineConfiguration.
+        # https://docs.aws.amazon.com/athena/latest/ug/notebooks-spark-getting-started.html
+        spark_engine_version = self.config.get("spark_engine_version", None)
+        default_engine_config: Dict[str, Any] = {
             "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
-            "DefaultExecutorDpuSize": DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
-            "SparkProperties": default_spark_properties,
         }
+        if spark_engine_version != "3.5":
+            default_engine_config["CoordinatorDpuSize"] = DEFAULT_SPARK_COORDINATOR_DPU_SIZE
+            default_engine_config["DefaultExecutorDpuSize"] = DEFAULT_SPARK_EXECUTOR_DPU_SIZE
+            default_engine_config["SparkProperties"] = default_spark_properties
         engine_config = self.config.get("engine_config", None)
 
         if engine_config:
             provided_spark_properties = engine_config.get("SparkProperties", None)
             if provided_spark_properties:
                 default_spark_properties.update(provided_spark_properties)
+            if spark_engine_version != "3.5" and provided_spark_properties:
                 default_engine_config["SparkProperties"] = default_spark_properties
+            if "SparkProperties" in engine_config:
                 engine_config.pop("SparkProperties")
             default_engine_config.update(engine_config)
+
+        # For Spark 3.5, convert SparkProperties to Classifications format.
+        # "3.5" is the exact value Athena uses for Apache Spark engine version.
+        if spark_engine_version == "3.5" and default_spark_properties:
+            classifications = default_engine_config.get("Classifications", [])
+            merged_props = {k: str(v) for k, v in default_spark_properties.items()}
+            existing = next((c for c in classifications if c["Name"] == "spark-defaults"), None)
+            if existing:
+                existing["Properties"].update(merged_props)
+            else:
+                classifications.append({"Name": "spark-defaults", "Properties": merged_props})
+            default_engine_config["Classifications"] = classifications
+
         engine_config = default_engine_config
 
         if not isinstance(engine_config, dict):
@@ -155,15 +175,10 @@ class AthenaSparkSessionConfig:
             "DefaultExecutorDpuSize",
             "SparkProperties",
             "AdditionalConfigs",
+            "Classifications",
         }
 
-        if set(engine_config.keys()) - {
-            "CoordinatorDpuSize",
-            "MaxConcurrentDpus",
-            "DefaultExecutorDpuSize",
-            "SparkProperties",
-            "AdditionalConfigs",
-        }:
+        if set(engine_config.keys()) - expected_keys:
             raise KeyError(
                 f"The engine configuration keys provided do not match the expected athena engine keys: {expected_keys}"
             )

@@ -1,3 +1,5 @@
+import os
+import threading
 import time
 from functools import cached_property
 from typing import Any, Dict
@@ -12,6 +14,80 @@ from dbt.adapters.athena.session import AthenaSparkSessionManager
 from dbt.adapters.base import PythonJobHelper
 
 SUBMISSION_LANGUAGE = "python"
+
+# Minimum remaining token lifetime before refreshing (seconds).
+_TOKEN_REFRESH_MARGIN_SECONDS = 120
+
+_spark_connect_env_lock = threading.Lock()
+_spark_connect_env_set = False
+
+
+def _ensure_spark_connect_env() -> None:
+    """Set SPARK_CONNECT_MODE_ENABLED=1 once for the process."""
+    global _spark_connect_env_set
+    if _spark_connect_env_set:
+        return
+    with _spark_connect_env_lock:
+        if not _spark_connect_env_set:
+            os.environ["SPARK_CONNECT_MODE_ENABLED"] = "1"
+            _spark_connect_env_set = True
+
+
+def _create_athena_channel_builder(
+    athena_client: Any,
+    session_id: str,
+    endpoint_url: str,
+    initial_auth_token: str | None = None,
+    initial_token_expiry: Any = None,
+) -> Any:
+    """Create a ChannelBuilder subclass that auto-refreshes the Athena AuthToken.
+
+    The AuthToken from GetSessionEndpoint expires after ~29 minutes.
+    This builder calls GetSessionEndpoint to obtain a fresh token
+    whenever the current token is about to expire, so that long-running
+    Spark Connect jobs are not interrupted by PERMISSION_DENIED errors.
+
+    Returns a ChannelBuilder subclass instance (import deferred to avoid
+    top-level pyspark dependency).
+    """
+    from datetime import datetime, timezone
+
+    from pyspark.sql.connect.client.core import ChannelBuilder
+
+    class AthenaChannelBuilder(ChannelBuilder):
+        def __init__(self, client: Any, sid: str, url: str, auth_token: str | None, token_expiry: Any):
+            sc_url = url.replace("https://", "sc://", 1) + ":443/;use_ssl=true"
+            super().__init__(sc_url)
+            self._athena_client = client
+            self._athena_session_id = sid
+            self._auth_token = auth_token
+            self._token_expiry = token_expiry
+
+        def _refresh_token_if_needed(self) -> None:
+            if self._auth_token and self._token_expiry:
+                remaining = (self._token_expiry - datetime.now(timezone.utc)).total_seconds()
+                if remaining > _TOKEN_REFRESH_MARGIN_SECONDS:
+                    return
+                LOGGER.debug(f"AuthToken expiring in {remaining:.0f}s, refreshing")
+
+            response = self._athena_client.get_session_endpoint(
+                SessionId=self._athena_session_id
+            )
+            auth_token = response.get("AuthToken")
+            if not auth_token:
+                raise DbtRuntimeError(
+                    f"GetSessionEndpoint returned no AuthToken for session {self._athena_session_id}"
+                )
+            self._auth_token = auth_token
+            self._token_expiry = response.get("AuthTokenExpirationTime")
+
+        def metadata(self):
+            self._refresh_token_if_needed()
+            base = [(k, v) for k, v in super().metadata() if k != "x-aws-proxy-auth"]
+            base.append(("x-aws-proxy-auth", self._auth_token))
+            return base
+
+    return AthenaChannelBuilder(athena_client, session_id, endpoint_url, initial_auth_token, initial_token_expiry)
 
 
 class AthenaPythonJobHelper(PythonJobHelper):
@@ -42,6 +118,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
             self.polling_interval,
             self.engine_config,
             self.relation_name,
+            spark_managed_logging=self.config.config.get("spark_managed_logging", False),
         )
 
     @cached_property
@@ -107,22 +184,121 @@ class AthenaPythonJobHelper(PythonJobHelper):
         """
         Submit a calculation to Athena.
 
-        This function submits a calculation to Athena for execution using the provided compiled code.
-        It starts a calculation execution with the current session ID and the compiled code as the code block.
-        The function then polls until the calculation execution is completed, and retrieves the result.
-        If the execution is successful and completed, the result S3 URI is returned. Otherwise, a DbtRuntimeError
-        is raised with the execution status.
-
-        Args:
-            compiled_code (str): The compiled code to submit for execution.
-
-        Returns:
-            dict: The result S3 URI if the execution is successful and completed.
-
-        Raises:
-            DbtRuntimeError: If the execution ends in a state other than "COMPLETED".
-
+        For PySpark engine version 3, uses the Calculations API
+        (StartCalculationExecution).
+        For Apache Spark version 3.5+, uses Spark Connect via
+        GetSessionEndpoint.
         """
+        if self.config.config.get("spark_engine_version") == "3.5":
+            return self._submit_spark_connect(compiled_code)
+        return self._submit_calculation_api(compiled_code)
+
+    def _wait_for_endpoint(self) -> Dict[str, Any]:
+        """Poll until the session endpoint is ready and return the full response."""
+        import random
+
+        polling_interval = self.polling_interval
+        timer: float = 0
+        throttle_backoff: float = 0
+        while True:
+            try:
+                response = self.athena_client.get_session_endpoint(
+                    SessionId=self.session_id
+                )
+                endpoint_url = response.get("EndpointUrl")
+                if endpoint_url:
+                    if not response.get("AuthToken"):
+                        raise DbtRuntimeError(
+                            f"GetSessionEndpoint returned no AuthToken for session {self.session_id}"
+                        )
+                    return response
+                throttle_backoff = 0
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "ThrottlingException":
+                    throttle_backoff = min((throttle_backoff or 1) * 2, 30) + random.uniform(0, 1)
+                    LOGGER.warning(
+                        f"Session {self.session_id} endpoint throttled, backing off {throttle_backoff:.1f}s"
+                    )
+                else:
+                    throttle_backoff = 0
+                    LOGGER.debug(f"Waiting for session {self.session_id} endpoint: {e}")
+            if timer >= self.timeout:
+                raise DbtRuntimeError(
+                    f"Session {self.session_id} endpoint did not become available within {self.timeout}s"
+                )
+            sleep_time = throttle_backoff if throttle_backoff else polling_interval
+            time.sleep(sleep_time)
+            timer += sleep_time
+
+    def _submit_spark_connect(self, compiled_code: str) -> Any:
+        """Submit code via Spark Connect (Apache Spark version 3.5+).
+
+        Uses AthenaChannelBuilder to auto-refresh the AuthToken before
+        it expires (~29 min TTL), enabling long-running jobs.
+        Enforces self.timeout as a hard execution time limit covering both
+        endpoint wait and code execution.
+        """
+        if not compiled_code.strip():
+            return {}
+
+        _ensure_spark_connect_env()
+
+        spark = None
+        timer = None
+        timeout_event = threading.Event()
+        start_time = time.monotonic()
+
+        try:
+            response = self._wait_for_endpoint()
+            channel_builder = _create_athena_channel_builder(
+                self.athena_client,
+                self.session_id,
+                response["EndpointUrl"],
+                initial_auth_token=response.get("AuthToken"),
+                initial_token_expiry=response.get("AuthTokenExpirationTime"),
+            )
+
+            from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
+
+            spark = ConnectSparkSession.builder.channelBuilder(channel_builder).create()
+
+            elapsed = time.monotonic() - start_time
+            remaining = max(self.timeout - elapsed, 0)
+
+            def _on_timeout():
+                timeout_event.set()
+                LOGGER.warning(
+                    f"Model {self.relation_name} - Execution timed out after {self.timeout}s"
+                )
+                spark.interruptAll()
+
+            timer = threading.Timer(remaining, _on_timeout)
+            timer.start()
+
+            exec_globals = {"spark": spark}
+            exec(compiled_code, exec_globals)
+        except DbtRuntimeError:
+            raise
+        except Exception as e:
+            if timeout_event.is_set():
+                raise DbtRuntimeError(
+                    f"Spark Connect execution timed out after {self.timeout} seconds."
+                )
+            import traceback
+            LOGGER.error(f"Spark Connect traceback:\n{traceback.format_exc()}")
+            raise DbtRuntimeError(f"Spark Connect execution failed: {type(e).__name__}: {e}") from e
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if spark is not None:
+                spark.stop()
+            self.spark_connection.set_spark_session_load(self.session_id, -1)
+
+        return {}
+
+    def _submit_calculation_api(self, compiled_code: str) -> Any:
+        """Submit code via Calculations API (PySpark engine version 3)."""
         # Seeing an empty calculation along with main python model code calculation is submitted for almost every model
         # Also, if not returning the result json, we are getting green ERROR messages instead of OK messages.
         # And with this handling, the run model code in target folder every model under run folder seems to be empty
@@ -171,11 +347,14 @@ class AthenaPythonJobHelper(PythonJobHelper):
             LOGGER.debug(
                 f"Model {self.relation_name} - Received execution status {execution_status}"
             )
+            result = {}
             if execution_status == "COMPLETED":
                 try:
-                    result = self.athena_client.get_calculation_execution(
+                    execution = self.athena_client.get_calculation_execution(
                         CalculationExecutionId=calculation_execution_id
-                    )["Result"]
+                    )
+                    result = execution["Result"]
+                    result["Statistics"] = execution.get("Statistics", {})
                 except Exception as e:
                     LOGGER.error(f"Unable to retrieve results: Got: {e}")
                     result = {}

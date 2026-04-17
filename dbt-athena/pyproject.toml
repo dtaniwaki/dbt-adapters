@@ -38,6 +38,9 @@ dependencies=[
     "pydantic>=1.10,<3.0",
     "tenacity>=8.2,<10.0",
 ]
+[project.optional-dependencies]
+spark_connect = ["pyspark[connect]>=3.5.6,<3.6", "setuptools"]
+
 [project.urls]
 Homepage = "https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-athena"
 Documentation = "https://docs.getdbt.com"

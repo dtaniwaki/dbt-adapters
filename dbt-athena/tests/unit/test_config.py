@@ -123,5 +123,91 @@ class TestAthenaSparkSessionConfig:
             "DefaultExecutorDpuSize",
             "SparkProperties",
             "AdditionalConfigs",
+            "Classifications",
         }
         assert len(diff) == 0
+
+
+class TestSparkEngineVersion35:
+    """Tests for spark_engine_version=3.5 behaviour in set_engine_config."""
+
+    def test_excludes_dpu_and_spark_properties(self):
+        config = AthenaSparkSessionConfig({"spark_engine_version": "3.5"})
+        engine_config = config.set_engine_config()
+        assert "CoordinatorDpuSize" not in engine_config
+        assert "DefaultExecutorDpuSize" not in engine_config
+        assert "SparkProperties" not in engine_config
+        assert "MaxConcurrentDpus" in engine_config
+
+    def test_includes_dpu_and_spark_properties_without_version(self):
+        config = AthenaSparkSessionConfig({})
+        engine_config = config.set_engine_config()
+        assert "CoordinatorDpuSize" in engine_config
+        assert "DefaultExecutorDpuSize" in engine_config
+        assert "SparkProperties" in engine_config
+
+    def test_user_engine_config_merged_for_35(self):
+        config = AthenaSparkSessionConfig(
+            {
+                "spark_engine_version": "3.5",
+                "engine_config": {"MaxConcurrentDpus": 10},
+            }
+        )
+        engine_config = config.set_engine_config()
+        assert engine_config["MaxConcurrentDpus"] == 10
+        assert "CoordinatorDpuSize" not in engine_config
+
+    def test_user_spark_properties_converted_to_classifications_for_35(self):
+        config = AthenaSparkSessionConfig(
+            {
+                "spark_engine_version": "3.5",
+                "engine_config": {
+                    "MaxConcurrentDpus": 5,
+                    "SparkProperties": {"spark.executor.memory": "4g"},
+                },
+            }
+        )
+        engine_config = config.set_engine_config()
+        assert "SparkProperties" not in engine_config
+        assert "Classifications" in engine_config
+        spark_defaults = next(c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults")
+        assert spark_defaults["Properties"]["spark.executor.memory"] == "4g"
+
+    def test_user_spark_properties_merged_for_non_35(self):
+        config = AthenaSparkSessionConfig(
+            {
+                "engine_config": {
+                    "CoordinatorDpuSize": 1,
+                    "MaxConcurrentDpus": 2,
+                    "DefaultExecutorDpuSize": 1,
+                    "SparkProperties": {"spark.executor.memory": "4g"},
+                },
+            }
+        )
+        engine_config = config.set_engine_config()
+        assert "spark.executor.memory" in engine_config["SparkProperties"]
+
+    def test_classifications_generated_for_iceberg_35(self):
+        config = AthenaSparkSessionConfig({"spark_engine_version": "3.5", "table_type": "iceberg"})
+        engine_config = config.set_engine_config()
+        assert "Classifications" in engine_config
+        spark_defaults = next(c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults")
+        assert "spark.sql.catalog.spark_catalog" in spark_defaults["Properties"]
+
+    def test_classifications_merge_with_user_provided(self):
+        config = AthenaSparkSessionConfig(
+            {
+                "spark_engine_version": "3.5",
+                "table_type": "iceberg",
+                "engine_config": {
+                    "MaxConcurrentDpus": 5,
+                    "Classifications": [
+                        {"Name": "spark-defaults", "Properties": {"spark.custom": "value"}},
+                    ],
+                },
+            }
+        )
+        engine_config = config.set_engine_config()
+        spark_defaults = next(c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults")
+        assert spark_defaults["Properties"]["spark.custom"] == "value"
+        assert "spark.sql.catalog.spark_catalog" in spark_defaults["Properties"]
