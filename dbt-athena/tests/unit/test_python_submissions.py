@@ -410,7 +410,7 @@ class TestSessionStateErrorHandling:
                 mock_api.assert_called_once_with("print('hello')")
 
     def test_submit_spark_connect_empty_code(self, mock_credentials):
-        """_submit_spark_connect returns empty dict for blank code."""
+        """_submit_spark_connect returns truthy dict for blank code."""
         parsed_model = {
             "alias": "test_model",
             "relation_name": "test_relation",
@@ -431,7 +431,7 @@ class TestSessionStateErrorHandling:
 
             helper = AthenaPythonJobHelper(parsed_model, mock_credentials)
             result = helper._submit_spark_connect("   ")
-            assert result == {}
+            assert result == {"SparkConnect": True}
 
     def test_submit_spark_connect_timeout(self, mock_credentials):
         """_submit_spark_connect raises DbtRuntimeError if endpoint never becomes available."""
@@ -504,7 +504,7 @@ class TestSessionStateErrorHandling:
                 }):
                     result = helper._submit_spark_connect("x = 1")
 
-            assert result == {}
+            assert result == {"SparkConnect": True}
             mock_spark.stop.assert_called_once()
             mock_session_manager.set_spark_session_load.assert_called_once_with("session-id", -1)
 

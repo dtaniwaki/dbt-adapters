@@ -132,11 +132,12 @@ class AthenaSparkSessionConfig:
         # Apache Spark 3.5+ does not support CoordinatorDpuSize,
         # DefaultExecutorDpuSize, and SparkProperties in EngineConfiguration.
         # https://docs.aws.amazon.com/athena/latest/ug/notebooks-spark-getting-started.html
-        spark_engine_version = self.config.get("spark_engine_version", None)
+        spark_engine_version = str(self.config.get("spark_engine_version", ""))
+        is_spark_35 = spark_engine_version == "3.5"
         default_engine_config: Dict[str, Any] = {
             "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
         }
-        if spark_engine_version != "3.5":
+        if not is_spark_35:
             default_engine_config["CoordinatorDpuSize"] = DEFAULT_SPARK_COORDINATOR_DPU_SIZE
             default_engine_config["DefaultExecutorDpuSize"] = DEFAULT_SPARK_EXECUTOR_DPU_SIZE
             default_engine_config["SparkProperties"] = default_spark_properties
@@ -146,15 +147,19 @@ class AthenaSparkSessionConfig:
             provided_spark_properties = engine_config.get("SparkProperties", None)
             if provided_spark_properties:
                 default_spark_properties.update(provided_spark_properties)
-            if spark_engine_version != "3.5" and provided_spark_properties:
+            if not is_spark_35 and provided_spark_properties:
                 default_engine_config["SparkProperties"] = default_spark_properties
             if "SparkProperties" in engine_config:
                 engine_config.pop("SparkProperties")
             default_engine_config.update(engine_config)
 
+        # Spark 3.5 does not accept these keys; strip if user provided them.
+        if is_spark_35:
+            for key in ("CoordinatorDpuSize", "DefaultExecutorDpuSize", "SparkProperties"):
+                default_engine_config.pop(key, None)
+
         # For Spark 3.5, convert SparkProperties to Classifications format.
-        # "3.5" is the exact value Athena uses for Apache Spark engine version.
-        if spark_engine_version == "3.5" and default_spark_properties:
+        if is_spark_35 and default_spark_properties:
             classifications = default_engine_config.get("Classifications", [])
             merged_props = {k: str(v) for k, v in default_spark_properties.items()}
             existing = next((c for c in classifications if c["Name"] == "spark-defaults"), None)

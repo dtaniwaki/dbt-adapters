@@ -189,7 +189,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
         For Apache Spark version 3.5+, uses Spark Connect via
         GetSessionEndpoint.
         """
-        if self.config.config.get("spark_engine_version") == "3.5":
+        if str(self.config.config.get("spark_engine_version", "")) == "3.5":
             return self._submit_spark_connect(compiled_code)
         return self._submit_calculation_api(compiled_code)
 
@@ -240,10 +240,11 @@ class AthenaPythonJobHelper(PythonJobHelper):
         endpoint wait and code execution.
         """
         if not compiled_code.strip():
-            return {}
+            return {"SparkConnect": True}
 
         _ensure_spark_connect_env()
 
+        session_id = self.session_id
         spark = None
         timer = None
         timeout_event = threading.Event()
@@ -253,7 +254,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
             response = self._wait_for_endpoint()
             channel_builder = _create_athena_channel_builder(
                 self.athena_client,
-                self.session_id,
+                session_id,
                 response["EndpointUrl"],
                 initial_auth_token=response.get("AuthToken"),
                 initial_token_expiry=response.get("AuthTokenExpirationTime"),
@@ -264,7 +265,11 @@ class AthenaPythonJobHelper(PythonJobHelper):
             spark = ConnectSparkSession.builder.channelBuilder(channel_builder).create()
 
             elapsed = time.monotonic() - start_time
-            remaining = max(self.timeout - elapsed, 0)
+            remaining = self.timeout - elapsed
+            if remaining <= 0:
+                raise DbtRuntimeError(
+                    f"Spark Connect execution timed out after {self.timeout} seconds."
+                )
 
             def _on_timeout():
                 timeout_event.set()
@@ -293,9 +298,9 @@ class AthenaPythonJobHelper(PythonJobHelper):
                 timer.cancel()
             if spark is not None:
                 spark.stop()
-            self.spark_connection.set_spark_session_load(self.session_id, -1)
+            self.spark_connection.set_spark_session_load(session_id, -1)
 
-        return {}
+        return {"SparkConnect": True}
 
     def _submit_calculation_api(self, compiled_code: str) -> Any:
         """Submit code via Calculations API (PySpark engine version 3)."""
