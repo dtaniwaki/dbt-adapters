@@ -55,7 +55,9 @@ def _create_athena_channel_builder(
     from pyspark.sql.connect.client.core import ChannelBuilder
 
     class AthenaChannelBuilder(ChannelBuilder):
-        def __init__(self, client: Any, sid: str, url: str, auth_token: str | None, token_expiry: Any):
+        def __init__(
+            self, client: Any, sid: str, url: str, auth_token: str | None, token_expiry: Any
+        ):
             sc_url = url.replace("https://", "sc://", 1) + ":443/;use_ssl=true"
             super().__init__(sc_url)
             self._athena_client = client
@@ -70,9 +72,7 @@ def _create_athena_channel_builder(
                     return
                 LOGGER.debug(f"AuthToken expiring in {remaining:.0f}s, refreshing")
 
-            response = self._athena_client.get_session_endpoint(
-                SessionId=self._athena_session_id
-            )
+            response = self._athena_client.get_session_endpoint(SessionId=self._athena_session_id)
             auth_token = response.get("AuthToken")
             if not auth_token:
                 raise DbtRuntimeError(
@@ -87,7 +87,9 @@ def _create_athena_channel_builder(
             base.append(("x-aws-proxy-auth", self._auth_token))
             return base
 
-    return AthenaChannelBuilder(athena_client, session_id, endpoint_url, initial_auth_token, initial_token_expiry)
+    return AthenaChannelBuilder(
+        athena_client, session_id, endpoint_url, initial_auth_token, initial_token_expiry
+    )
 
 
 class AthenaPythonJobHelper(PythonJobHelper):
@@ -202,9 +204,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
         throttle_backoff: float = 0
         while True:
             try:
-                response = self.athena_client.get_session_endpoint(
-                    SessionId=self.session_id
-                )
+                response = self.athena_client.get_session_endpoint(SessionId=self.session_id)
                 endpoint_url = response.get("EndpointUrl")
                 if endpoint_url:
                     if not response.get("AuthToken"):
@@ -291,8 +291,11 @@ class AthenaPythonJobHelper(PythonJobHelper):
                     f"Spark Connect execution timed out after {self.timeout} seconds."
                 )
             import traceback
+
             LOGGER.error(f"Spark Connect traceback:\n{traceback.format_exc()}")
-            raise DbtRuntimeError(f"Spark Connect execution failed: {type(e).__name__}: {e}") from e
+            raise DbtRuntimeError(
+                f"Spark Connect execution failed: {type(e).__name__}: {e}"
+            ) from e
         finally:
             if timer is not None:
                 timer.cancel()

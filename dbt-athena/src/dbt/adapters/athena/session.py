@@ -268,6 +268,4 @@ class AthenaSparkSessionManager:
         Returns: None
         """
         with self.lock:
-            spark_session_load[session_id] = (
-                spark_session_load.get(session_id, 0) + change
-            )
+            spark_session_load[session_id] = spark_session_load.get(session_id, 0) + change

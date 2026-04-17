@@ -395,7 +395,9 @@ class TestSessionStateErrorHandling:
                 helper.submit("print('hello')")
                 mock_sc.assert_called_once_with("print('hello')")
 
-    def test_submit_routes_to_calculation_api_without_35(self, mock_credentials, mock_parsed_model):
+    def test_submit_routes_to_calculation_api_without_35(
+        self, mock_credentials, mock_parsed_model
+    ):
         """submit() delegates to _submit_calculation_api when spark_engine_version is not 3.5."""
         with patch(
             "dbt.adapters.athena.python_submissions.AthenaSparkSessionManager"
@@ -485,23 +487,30 @@ class TestSessionStateErrorHandling:
 
             helper = AthenaPythonJobHelper(parsed_model, mock_credentials)
             mock_athena_client = Mock()
-            mock_athena_client.get_session_endpoint = Mock(return_value={
-                "EndpointUrl": "https://spark.athena.example.com",
-                "AuthToken": "test-token",
-            })
+            mock_athena_client.get_session_endpoint = Mock(
+                return_value={
+                    "EndpointUrl": "https://spark.athena.example.com",
+                    "AuthToken": "test-token",
+                }
+            )
             helper.__dict__["athena_client"] = mock_athena_client
 
             mock_spark = Mock()
             mock_connect_session_cls = Mock()
-            mock_connect_session_cls.builder.channelBuilder.return_value.create.return_value = mock_spark
+            mock_connect_session_cls.builder.channelBuilder.return_value.create.return_value = (
+                mock_spark
+            )
 
             with patch("dbt.adapters.athena.python_submissions._create_athena_channel_builder"):
-                with patch.dict("sys.modules", {
-                    "pyspark": Mock(),
-                    "pyspark.sql": Mock(),
-                    "pyspark.sql.connect": Mock(),
-                    "pyspark.sql.connect.session": Mock(SparkSession=mock_connect_session_cls),
-                }):
+                with patch.dict(
+                    "sys.modules",
+                    {
+                        "pyspark": Mock(),
+                        "pyspark.sql": Mock(),
+                        "pyspark.sql.connect": Mock(),
+                        "pyspark.sql.connect.session": Mock(SparkSession=mock_connect_session_cls),
+                    },
+                ):
                     result = helper._submit_spark_connect("x = 1")
 
             assert result == {"SparkConnect": True}
@@ -530,9 +539,11 @@ class TestSessionStateErrorHandling:
 
             helper = AthenaPythonJobHelper(parsed_model, mock_credentials)
             mock_athena_client = Mock()
-            mock_athena_client.get_session_endpoint = Mock(return_value={
-                "EndpointUrl": "https://spark.athena.example.com",
-            })
+            mock_athena_client.get_session_endpoint = Mock(
+                return_value={
+                    "EndpointUrl": "https://spark.athena.example.com",
+                }
+            )
             helper.__dict__["athena_client"] = mock_athena_client
 
             with pytest.raises(DbtRuntimeError, match="returned no AuthToken"):

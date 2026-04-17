@@ -1140,7 +1140,9 @@ class AthenaAdapter(SQLAdapter):
         if not submission_result:
             return AthenaAdapterResponse(_message="ERROR", code="ERROR")
 
-        statistics = submission_result.get("Statistics", {}) if isinstance(submission_result, dict) else {}
+        statistics = (
+            submission_result.get("Statistics", {}) if isinstance(submission_result, dict) else {}
+        )
         dpu_execution_in_millis = statistics.get("DpuExecutionInMillis")
 
         return AthenaAdapterResponse(

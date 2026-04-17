@@ -170,7 +170,9 @@ class TestSparkEngineVersion35:
         engine_config = config.set_engine_config()
         assert "SparkProperties" not in engine_config
         assert "Classifications" in engine_config
-        spark_defaults = next(c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults")
+        spark_defaults = next(
+            c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults"
+        )
         assert spark_defaults["Properties"]["spark.executor.memory"] == "4g"
 
     def test_user_spark_properties_merged_for_non_35(self):
@@ -191,7 +193,9 @@ class TestSparkEngineVersion35:
         config = AthenaSparkSessionConfig({"spark_engine_version": "3.5", "table_type": "iceberg"})
         engine_config = config.set_engine_config()
         assert "Classifications" in engine_config
-        spark_defaults = next(c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults")
+        spark_defaults = next(
+            c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults"
+        )
         assert "spark.sql.catalog.spark_catalog" in spark_defaults["Properties"]
 
     def test_classifications_merge_with_user_provided(self):
@@ -208,6 +212,8 @@ class TestSparkEngineVersion35:
             }
         )
         engine_config = config.set_engine_config()
-        spark_defaults = next(c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults")
+        spark_defaults = next(
+            c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults"
+        )
         assert spark_defaults["Properties"]["spark.custom"] == "value"
         assert "spark.sql.catalog.spark_catalog" in spark_defaults["Properties"]
