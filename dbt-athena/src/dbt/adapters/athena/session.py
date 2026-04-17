@@ -4,7 +4,7 @@ import time
 from functools import cached_property
 from hashlib import md5
 from typing import Any, Dict
-from uuid import UUID
+
 
 import boto3
 import boto3.session
@@ -20,8 +20,8 @@ from dbt.adapters.athena.constants import (
 from dbt.adapters.contracts.connection import Connection
 
 invocation_id = get_invocation_id()
-spark_session_list: Dict[UUID, str] = {}
-spark_session_load: Dict[UUID, int] = {}
+spark_session_list: Dict[str, str] = {}
+spark_session_load: Dict[str, int] = {}
 
 
 def get_boto3_session(connection: Connection) -> boto3.session.Session:
@@ -56,6 +56,7 @@ class AthenaSparkSessionManager:
         polling_interval: float,
         engine_config: Dict[str, int],
         relation_name: str = "N/A",
+        spark_managed_logging: bool = False,
     ) -> None:
         """
         Initialize the AthenaSparkSessionManager instance.
@@ -73,6 +74,7 @@ class AthenaSparkSessionManager:
         self.engine_config = engine_config
         self.lock = threading.Lock()
         self.relation_name = relation_name
+        self.spark_managed_logging = spark_managed_logging
 
     @cached_property
     def spark_threads(self) -> int:
@@ -130,7 +132,7 @@ class AthenaSparkSessionManager:
         ).hexdigest()
         return f"dbt: {invocation_id} - {hash_desc}"
 
-    def get_session_id(self, session_query_capacity: int = 1) -> UUID:
+    def get_session_id(self, session_query_capacity: int = 1) -> str:
         """
         Get a session ID for the Spark session.
         When does a new session get created:
@@ -174,7 +176,7 @@ class AthenaSparkSessionManager:
                 )
                 return self.start_session()
 
-    def start_session(self) -> UUID:
+    def start_session(self) -> str:
         """
         Start an Athena session.
 
@@ -198,10 +200,10 @@ class AthenaSparkSessionManager:
             self.poll_until_session_creation(session_id)
 
         with self.lock:
-            spark_session_list[UUID(session_id)] = self.session_description
-            spark_session_load[UUID(session_id)] = 1
+            spark_session_list[session_id] = self.session_description
+            spark_session_load[session_id] = 1
 
-        return UUID(session_id)
+        return session_id
 
     def poll_until_session_creation(self, session_id: str) -> None:
         """
@@ -256,8 +258,8 @@ class AthenaSparkSessionManager:
         Returns: None
         """
         with self.lock:
-            spark_session_list.pop(UUID(session_id), "Session id not found")
-            spark_session_load.pop(UUID(session_id), "Session id not found")
+            spark_session_list.pop(session_id, "Session id not found")
+            spark_session_load.pop(session_id, "Session id not found")
 
     def set_spark_session_load(self, session_id: str, change: int) -> None:
         """
@@ -266,6 +268,6 @@ class AthenaSparkSessionManager:
         Returns: None
         """
         with self.lock:
-            spark_session_load[UUID(session_id)] = (
-                spark_session_load.get(UUID(session_id), 0) + change
+            spark_session_load[session_id] = (
+                spark_session_load.get(session_id, 0) + change
             )

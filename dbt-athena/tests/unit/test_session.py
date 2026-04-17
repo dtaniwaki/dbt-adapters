@@ -1,5 +1,4 @@
 from unittest.mock import Mock, patch
-from uuid import UUID
 
 import botocore.session
 import pytest
@@ -97,7 +96,7 @@ class TestAthenaSparkSessionManager:
             ),
             (
                 {"Status": {"SessionId": "635c1c6d-766c-408b-8bce-fae8ea7006f7", "State": "IDLE"}},
-                UUID("635c1c6d-766c-408b-8bce-fae8ea7006f7"),
+                "635c1c6d-766c-408b-8bce-fae8ea7006f7",
             ),
             pytest.param(
                 {"Status": {"SessionId": "test_session_id", "State": "TERMINATED"}},
