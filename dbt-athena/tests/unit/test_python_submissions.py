@@ -549,6 +549,132 @@ class TestSessionStateErrorHandling:
             with pytest.raises(DbtRuntimeError, match="returned no AuthToken"):
                 helper._submit_spark_connect("print('hello')")
 
+    @pytest.mark.parametrize(
+        "error_message",
+        [
+            "Unable to load credentials from any of the providers",
+            "Pool not running",
+        ],
+    )
+    def test_spark_connect_retries_transient_error(self, mock_credentials, error_message):
+        """_submit_spark_connect retries on transient errors with a new session."""
+        parsed_model = {
+            "alias": "test_model",
+            "relation_name": "test_relation",
+            "schema": "test_schema",
+            "config": {
+                "timeout": 30,
+                "polling_interval": 1,
+                "spark_engine_version": "3.5",
+                "engine_config": {"MaxConcurrentDpus": 2},
+            },
+        }
+        with patch(
+            "dbt.adapters.athena.python_submissions.AthenaSparkSessionManager"
+        ) as MockSessionManager:
+            mock_session_manager = Mock()
+            session_ids = iter(["session-1", "session-2"])
+            mock_session_manager.get_session_id = Mock(side_effect=lambda: next(session_ids))
+            mock_session_manager.set_spark_session_load = Mock()
+            mock_session_manager.terminate_and_remove_session = Mock()
+            MockSessionManager.return_value = mock_session_manager
+
+            helper = AthenaPythonJobHelper(parsed_model, mock_credentials)
+            mock_athena_client = Mock()
+            mock_athena_client.get_session_endpoint = Mock(
+                return_value={
+                    "EndpointUrl": "https://spark.athena.example.com",
+                    "AuthToken": "test-token",
+                }
+            )
+            helper.__dict__["athena_client"] = mock_athena_client
+
+            call_count = [0]
+            mock_spark = Mock()
+
+            def mock_exec(code, globals_dict):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise ValueError(error_message)
+
+            mock_connect_session_cls = Mock()
+            mock_connect_session_cls.builder.channelBuilder.return_value.create.return_value = (
+                mock_spark
+            )
+
+            with patch("dbt.adapters.athena.python_submissions._create_athena_channel_builder"):
+                with patch.dict(
+                    "sys.modules",
+                    {
+                        "pyspark": Mock(),
+                        "pyspark.sql": Mock(),
+                        "pyspark.sql.connect": Mock(),
+                        "pyspark.sql.connect.session": Mock(SparkSession=mock_connect_session_cls),
+                    },
+                ):
+                    with patch("dbt.adapters.athena.python_submissions.time.sleep"):
+                        with patch("builtins.exec", side_effect=mock_exec):
+                            result = helper._submit_spark_connect("x = 1")
+
+            assert result == {"SparkConnect": True}
+            assert call_count[0] == 2
+            mock_session_manager.terminate_and_remove_session.assert_called_once_with("session-1")
+
+    def test_spark_connect_no_retry_on_code_error(self, mock_credentials):
+        """_submit_spark_connect does NOT retry on non-transient code errors."""
+        parsed_model = {
+            "alias": "test_model",
+            "relation_name": "test_relation",
+            "schema": "test_schema",
+            "config": {
+                "timeout": 30,
+                "polling_interval": 1,
+                "spark_engine_version": "3.5",
+                "engine_config": {"MaxConcurrentDpus": 2},
+            },
+        }
+        with patch(
+            "dbt.adapters.athena.python_submissions.AthenaSparkSessionManager"
+        ) as MockSessionManager:
+            mock_session_manager = Mock()
+            mock_session_manager.get_session_id = Mock(return_value="session-1")
+            mock_session_manager.set_spark_session_load = Mock()
+            MockSessionManager.return_value = mock_session_manager
+
+            helper = AthenaPythonJobHelper(parsed_model, mock_credentials)
+            mock_athena_client = Mock()
+            mock_athena_client.get_session_endpoint = Mock(
+                return_value={
+                    "EndpointUrl": "https://spark.athena.example.com",
+                    "AuthToken": "test-token",
+                }
+            )
+            helper.__dict__["athena_client"] = mock_athena_client
+
+            mock_spark = Mock()
+            mock_connect_session_cls = Mock()
+            mock_connect_session_cls.builder.channelBuilder.return_value.create.return_value = (
+                mock_spark
+            )
+
+            with patch("dbt.adapters.athena.python_submissions._create_athena_channel_builder"):
+                with patch.dict(
+                    "sys.modules",
+                    {
+                        "pyspark": Mock(),
+                        "pyspark.sql": Mock(),
+                        "pyspark.sql.connect": Mock(),
+                        "pyspark.sql.connect.session": Mock(SparkSession=mock_connect_session_cls),
+                    },
+                ):
+                    with patch("builtins.exec", side_effect=TypeError("some code error")):
+                        with pytest.raises(DbtRuntimeError, match="some code error"):
+                            helper._submit_spark_connect("x = 1")
+
+            # Session should NOT be terminated (not a transient error)
+            mock_session_manager.terminate_and_remove_session.assert_not_called()
+            mock_session_manager.set_spark_session_load.assert_called_once_with("session-1", -1)
+
     def test_submit_handles_busy_session_state(self, mock_credentials, mock_parsed_model):
         """Test that submit() continues to poll when session is BUSY."""
         session_id = uuid.uuid4()

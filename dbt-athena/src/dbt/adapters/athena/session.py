@@ -5,7 +5,6 @@ from functools import cached_property
 from hashlib import md5
 from typing import Any, Dict
 
-
 import boto3
 import boto3.session
 from dbt_common.exceptions import DbtRuntimeError
@@ -78,14 +77,16 @@ class AthenaSparkSessionManager:
 
     @cached_property
     def spark_threads(self) -> int:
-        """
-        Get the number of Spark threads.
+        """Max concurrent Spark sessions.
 
-        Returns:
-            int: The number of Spark threads. If not found in the profile, returns the default thread count.
+        Resolution order:
+        1. ``spark_threads`` in profile (credentials)
+        2. ``DEFAULT_THREAD_COUNT`` constant (fallback)
         """
+        configured = getattr(self.credentials, "spark_threads", None)
+        if configured is not None:
+            return int(configured)
         if not DEFAULT_THREAD_COUNT:
-            LOGGER.debug(f"""Threads not found in profile. Got: {DEFAULT_THREAD_COUNT}""")
             return 1
         return int(DEFAULT_THREAD_COUNT)
 
@@ -132,27 +133,46 @@ class AthenaSparkSessionManager:
         ).hexdigest()
         return f"dbt: {invocation_id} - {hash_desc}"
 
+    _DEAD_SESSION_STATES = frozenset({"FAILED", "TERMINATED", "TERMINATING", "DEGRADED"})
+
+    def _evict_dead_sessions(self) -> int:
+        """Check pool sessions and remove any that Athena has terminated.
+
+        Returns the number of evicted sessions.
+        """
+        evicted = 0
+        for session_id in list(spark_session_list):
+            try:
+                state = self.get_session_status(session_id).get("State", "")
+            except Exception:
+                state = "UNKNOWN"
+            if state in self._DEAD_SESSION_STATES or state == "UNKNOWN":
+                LOGGER.info(f"Evicting dead session {session_id} (state={state}) from pool")
+                self.remove_terminated_session(session_id)
+                evicted += 1
+        return evicted
+
     def get_session_id(self, session_query_capacity: int = 1) -> str:
-        """
-        Get a session ID for the Spark session.
-        When does a new session get created:
-        -   When thread limit not reached
-        -   When thread limit reached but same engine configuration session is not available
-        -   When thread limit reached and same engine configuration session exist and it is busy running a python model
-            and has one python model in queue (determined by session_query_capacity).
+        """Get or wait for a Spark session within the ``spark_threads`` limit.
 
-        Returns:
-            UUID: The session ID.
+        * Under the limit → create a new session immediately.
+        * At the limit → wait for an existing session to have capacity.
+        * If all sessions are dead (idle timeout etc.) → evict and create new.
+        * Raises ``DbtRuntimeError`` if no session becomes available
+          within ``self.timeout`` seconds.
         """
-        session_list = list(spark_session_list.items())
+        timer: float = 0
+        eviction_done = False
+        while True:
+            session_list = list(spark_session_list.items())
 
-        if len(session_list) < self.spark_threads:
-            LOGGER.debug(
-                f"Within thread limit, creating new session for model: {self.relation_name}"
-                f" with session description: {self.session_description}."
-            )
-            return self.start_session()
-        else:
+            if len(session_list) < self.spark_threads:
+                LOGGER.debug(
+                    f"Within thread limit ({len(session_list)}/{self.spark_threads}), "
+                    f"creating new session for model: {self.relation_name}"
+                )
+                return self.start_session()
+
             matching_session_id = next(
                 (
                     session_id
@@ -164,17 +184,33 @@ class AthenaSparkSessionManager:
             )
             if matching_session_id:
                 LOGGER.debug(
-                    f"Over thread limit, matching session found for model: {self.relation_name}"
-                    f" with session description: {self.session_description} and has capacity."
+                    f"At thread limit, reusing session {matching_session_id} "
+                    f"for model: {self.relation_name}"
                 )
                 self.set_spark_session_load(str(matching_session_id), 1)
                 return matching_session_id
-            else:
-                LOGGER.debug(
-                    f"Over thread limit, matching session not found or found with over capacity. Creating new session"
-                    f" for model: {self.relation_name} with session description: {self.session_description}."
+
+            # No available session. Before waiting, evict dead sessions once
+            # so that slots open up immediately (e.g. after idle timeout).
+            if not eviction_done:
+                evicted = self._evict_dead_sessions()
+                eviction_done = True
+                if evicted > 0:
+                    continue  # Re-check pool without sleeping
+
+            if timer >= self.timeout:
+                raise DbtRuntimeError(
+                    f"No Spark session available for model {self.relation_name} "
+                    f"within {self.timeout}s (spark_threads={self.spark_threads}, "
+                    f"active_sessions={len(session_list)})"
                 )
-                return self.start_session()
+
+            LOGGER.debug(
+                f"At thread limit ({len(session_list)}/{self.spark_threads}), "
+                f"all sessions busy. Waiting for model: {self.relation_name}"
+            )
+            time.sleep(self.polling_interval)
+            timer += self.polling_interval
 
     def start_session(self) -> str:
         """
@@ -260,6 +296,21 @@ class AthenaSparkSessionManager:
         with self.lock:
             spark_session_list.pop(session_id, "Session id not found")
             spark_session_load.pop(session_id, "Session id not found")
+
+    def terminate_and_remove_session(self, session_id: str) -> None:
+        """Terminate an Athena Spark session and remove it from the pool.
+
+        Sends TerminateSession to Athena so the session releases its DPU
+        resources immediately (instead of waiting for idle timeout), then
+        removes it from the in-memory pool.  Best-effort: errors from the
+        API call are logged but do not propagate.
+        """
+        try:
+            self.athena_client.terminate_session(SessionId=session_id)
+            LOGGER.info(f"Terminated Athena session {session_id}")
+        except Exception as e:
+            LOGGER.warning(f"Failed to terminate session {session_id}: {e}")
+        self.remove_terminated_session(session_id)
 
     def set_spark_session_load(self, session_id: str, change: int) -> None:
         """

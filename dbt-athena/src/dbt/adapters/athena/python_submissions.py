@@ -1,8 +1,9 @@
 import os
+import random
 import threading
 import time
 from functools import cached_property
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import botocore
 from dbt_common.exceptions import DbtRuntimeError
@@ -17,6 +18,27 @@ SUBMISSION_LANGUAGE = "python"
 
 # Minimum remaining token lifetime before refreshing (seconds).
 _TOKEN_REFRESH_MARGIN_SECONDS = 120
+
+# Max retry attempts for transient Spark Connect errors.
+_SPARK_CONNECT_MAX_RETRIES = 3
+
+# Patterns that indicate a transient Spark Connect error
+# where retrying with a new session is expected to succeed.
+_TRANSIENT_SPARK_PATTERNS = [
+    # Spark executor failed to obtain credentials from the provider chain.
+    # Observed as a transient issue when many sessions start concurrently.
+    "Unable to load credentials",
+    # gRPC connection pool was shut down (secondary failure after credentials
+    # or session error). A new session creates a fresh pool.
+    "Pool not running",
+]
+
+
+def _is_transient_spark_error(e: Exception) -> bool:
+    """Return True if the exception is a transient Spark Connect error."""
+    error_str = f"{type(e).__name__}: {e}"
+    return any(p in error_str for p in _TRANSIENT_SPARK_PATTERNS)
+
 
 _spark_connect_env_lock = threading.Lock()
 _spark_connect_env_set = False
@@ -37,7 +59,7 @@ def _create_athena_channel_builder(
     athena_client: Any,
     session_id: str,
     endpoint_url: str,
-    initial_auth_token: str | None = None,
+    initial_auth_token: Optional[str] = None,
     initial_token_expiry: Any = None,
 ) -> Any:
     """Create a ChannelBuilder subclass that auto-refreshes the Athena AuthToken.
@@ -56,7 +78,7 @@ def _create_athena_channel_builder(
 
     class AthenaChannelBuilder(ChannelBuilder):
         def __init__(
-            self, client: Any, sid: str, url: str, auth_token: str | None, token_expiry: Any
+            self, client: Any, sid: str, url: str, auth_token: Optional[str], token_expiry: Any
         ):
             sc_url = url.replace("https://", "sc://", 1) + ":443/;use_ssl=true"
             super().__init__(sc_url)
@@ -197,8 +219,6 @@ class AthenaPythonJobHelper(PythonJobHelper):
 
     def _wait_for_endpoint(self) -> Dict[str, Any]:
         """Poll until the session endpoint is ready and return the full response."""
-        import random
-
         polling_interval = self.polling_interval
         timer: float = 0
         throttle_backoff: float = 0
@@ -238,72 +258,113 @@ class AthenaPythonJobHelper(PythonJobHelper):
         it expires (~29 min TTL), enabling long-running jobs.
         Enforces self.timeout as a hard execution time limit covering both
         endpoint wait and code execution.
+
+        Transient Spark Connect errors (credential propagation failures,
+        gRPC pool shutdown) are retried with a new Athena session up to
+        ``_SPARK_CONNECT_MAX_RETRIES`` times.
         """
         if not compiled_code.strip():
             return {"SparkConnect": True}
 
         _ensure_spark_connect_env()
-
-        session_id = self.session_id
-        spark = None
-        timer = None
-        timeout_event = threading.Event()
         start_time = time.monotonic()
 
-        try:
-            response = self._wait_for_endpoint()
-            channel_builder = _create_athena_channel_builder(
-                self.athena_client,
-                session_id,
-                response["EndpointUrl"],
-                initial_auth_token=response.get("AuthToken"),
-                initial_token_expiry=response.get("AuthTokenExpirationTime"),
-            )
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _SPARK_CONNECT_MAX_RETRIES + 1):
+            session_id = self.session_id
+            spark = None
+            timer = None
+            timeout_event = threading.Event()
+            failed_transient = False
 
-            from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
+            try:
+                elapsed = time.monotonic() - start_time
+                remaining = self.timeout - elapsed
+                if remaining <= 0:
+                    raise DbtRuntimeError(
+                        f"Spark Connect execution timed out after {self.timeout} seconds."
+                    )
 
-            spark = ConnectSparkSession.builder.channelBuilder(channel_builder).create()
-
-            elapsed = time.monotonic() - start_time
-            remaining = self.timeout - elapsed
-            if remaining <= 0:
-                raise DbtRuntimeError(
-                    f"Spark Connect execution timed out after {self.timeout} seconds."
+                response = self._wait_for_endpoint()
+                channel_builder = _create_athena_channel_builder(
+                    self.athena_client,
+                    session_id,
+                    response["EndpointUrl"],
+                    initial_auth_token=response.get("AuthToken"),
+                    initial_token_expiry=response.get("AuthTokenExpirationTime"),
                 )
 
-            def _on_timeout():
-                timeout_event.set()
-                LOGGER.warning(
-                    f"Model {self.relation_name} - Execution timed out after {self.timeout}s"
-                )
-                spark.interruptAll()
+                from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
 
-            timer = threading.Timer(remaining, _on_timeout)
-            timer.start()
+                spark = ConnectSparkSession.builder.channelBuilder(channel_builder).create()
 
-            exec_globals = {"spark": spark}
-            exec(compiled_code, exec_globals)
-        except DbtRuntimeError:
-            raise
-        except Exception as e:
-            if timeout_event.is_set():
-                raise DbtRuntimeError(
-                    f"Spark Connect execution timed out after {self.timeout} seconds."
-                )
-            import traceback
+                elapsed = time.monotonic() - start_time
+                remaining = self.timeout - elapsed
+                if remaining <= 0:
+                    raise DbtRuntimeError(
+                        f"Spark Connect execution timed out after {self.timeout} seconds."
+                    )
 
-            LOGGER.error(f"Spark Connect traceback:\n{traceback.format_exc()}")
-            raise DbtRuntimeError(
-                f"Spark Connect execution failed: {type(e).__name__}: {e}"
-            ) from e
-        finally:
-            if timer is not None:
-                timer.cancel()
-            if spark is not None:
-                spark.stop()
-            self.spark_connection.set_spark_session_load(session_id, -1)
+                def _on_timeout():
+                    timeout_event.set()
+                    LOGGER.warning(
+                        f"Model {self.relation_name} - Execution timed out after {self.timeout}s"
+                    )
+                    spark.interruptAll()
 
-        return {"SparkConnect": True}
+                timer = threading.Timer(remaining, _on_timeout)
+                timer.start()
+
+                exec_globals = {"spark": spark}
+                exec(compiled_code, exec_globals)
+                return {"SparkConnect": True}
+            except DbtRuntimeError:
+                raise
+            except Exception as e:
+                if timeout_event.is_set():
+                    raise DbtRuntimeError(
+                        f"Spark Connect execution timed out after {self.timeout} seconds."
+                    )
+                last_error = e
+                if attempt < _SPARK_CONNECT_MAX_RETRIES and _is_transient_spark_error(e):
+                    import traceback
+
+                    failed_transient = True
+                    backoff = min(2**attempt, 30) + random.uniform(0, 1)
+                    LOGGER.warning(
+                        f"Model {self.relation_name} - Transient Spark Connect error "
+                        f"(attempt {attempt}/{_SPARK_CONNECT_MAX_RETRIES}), "
+                        f"retrying in {backoff:.1f}s with new session: "
+                        f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                    )
+                    time.sleep(backoff)
+                else:
+                    import traceback
+
+                    LOGGER.error(f"Spark Connect traceback:\n{traceback.format_exc()}")
+                    raise DbtRuntimeError(
+                        f"Spark Connect execution failed: {type(e).__name__}: {e}"
+                    ) from e
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                if spark is not None:
+                    spark.stop()
+                if failed_transient:
+                    # Terminate the failed session to free DPU resources,
+                    # then clear cached session_id so the next attempt
+                    # creates a fresh session.
+                    self.spark_connection.terminate_and_remove_session(session_id)
+                    if "session_id" in self.__dict__:
+                        del self.__dict__["session_id"]
+                else:
+                    self.spark_connection.set_spark_session_load(session_id, -1)
+
+        # All retries exhausted
+        raise DbtRuntimeError(
+            f"Spark Connect execution failed after {_SPARK_CONNECT_MAX_RETRIES} attempts: "
+            f"{type(last_error).__name__}: {last_error}"
+        )
 
     def _submit_calculation_api(self, compiled_code: str) -> Any:
         """Submit code via Calculations API (PySpark engine version 3)."""
