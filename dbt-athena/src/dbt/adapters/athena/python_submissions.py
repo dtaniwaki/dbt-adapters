@@ -28,6 +28,9 @@ _TRANSIENT_SPARK_PATTERNS = [
     # Spark executor failed to obtain credentials from the provider chain.
     # Observed as a transient issue when many sessions start concurrently.
     "Unable to load credentials",
+    # Spark executor failed to resolve the AWS region via DefaultAwsRegionProviderChain
+    # (IMDS not yet available at executor startup). Same transient pattern as credentials.
+    "Unable to load region",
     # gRPC connection pool was shut down (secondary failure after credentials
     # or session error). A new session creates a fresh pool.
     "Pool not running",
