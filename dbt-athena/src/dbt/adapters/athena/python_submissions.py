@@ -34,6 +34,9 @@ _TRANSIENT_SPARK_PATTERNS = [
     # gRPC connection pool was shut down (secondary failure after credentials
     # or session error). A new session creates a fresh pool.
     "Pool not running",
+    # Athena terminated the Spark session (idle timeout, DPU pressure, or
+    # concurrent session limit). A new session resolves this.
+    "Session not active",
 ]
 
 
