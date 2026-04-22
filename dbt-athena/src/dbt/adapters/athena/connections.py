@@ -35,7 +35,7 @@ from typing_extensions import Self
 from dbt.adapters.athena.config import get_boto3_config
 from dbt.adapters.athena.constants import LOGGER
 from dbt.adapters.athena.query_headers import AthenaMacroQueryStringSetter
-from dbt.adapters.athena.session import get_boto3_session
+from dbt.adapters.athena.session import get_boto3_session, terminate_all_spark_sessions
 from dbt.adapters.contracts.connection import (
     AdapterResponse,
     Connection,
@@ -336,6 +336,10 @@ class AthenaConnectionManager(SQLConnectionManager):
                 LOGGER.debug(f"There was an error parsing query stats {err}")
                 return -1, 0
         return cursor.rowcount, cursor.data_scanned_in_bytes
+
+    def cleanup_all(self) -> None:
+        terminate_all_spark_sessions()
+        super().cleanup_all()
 
     def cancel(self, connection: Connection) -> None:
         pass

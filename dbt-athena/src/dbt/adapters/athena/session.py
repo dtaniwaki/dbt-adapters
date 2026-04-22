@@ -21,6 +21,7 @@ from dbt.adapters.contracts.connection import Connection
 invocation_id = get_invocation_id()
 spark_session_list: Dict[str, str] = {}
 spark_session_load: Dict[str, int] = {}
+_spark_session_clients: Dict[str, Any] = {}
 
 
 def get_boto3_session(connection: Connection) -> boto3.session.Session:
@@ -238,6 +239,7 @@ class AthenaSparkSessionManager:
         with self.lock:
             spark_session_list[session_id] = self.session_description
             spark_session_load[session_id] = 1
+            _spark_session_clients[session_id] = self.athena_client
 
         return session_id
 
@@ -296,6 +298,7 @@ class AthenaSparkSessionManager:
         with self.lock:
             spark_session_list.pop(session_id, "Session id not found")
             spark_session_load.pop(session_id, "Session id not found")
+            _spark_session_clients.pop(session_id, None)
 
     def terminate_and_remove_session(self, session_id: str) -> None:
         """Terminate an Athena Spark session and remove it from the pool.
@@ -320,3 +323,21 @@ class AthenaSparkSessionManager:
         """
         with self.lock:
             spark_session_load[session_id] = spark_session_load.get(session_id, 0) + change
+
+
+def terminate_all_spark_sessions() -> None:
+    """Terminate all pooled Spark sessions to free DPU resources.
+
+    Called during adapter cleanup so sessions don't linger until idle timeout.
+    """
+    for session_id in list(spark_session_list):
+        client = _spark_session_clients.get(session_id)
+        if client:
+            try:
+                client.terminate_session(SessionId=session_id)
+                LOGGER.info(f"Terminated Athena Spark session {session_id}")
+            except Exception as e:
+                LOGGER.warning(f"Failed to terminate Spark session {session_id}: {e}")
+    spark_session_list.clear()
+    spark_session_load.clear()
+    _spark_session_clients.clear()
