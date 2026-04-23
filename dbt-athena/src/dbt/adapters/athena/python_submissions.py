@@ -137,6 +137,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
             credentials (AthenaCredentials): Credentials for Athena connection.
         """
         self.relation_name = parsed_model.get("relation_name", None)
+        self.query_comment = parsed_model.get("query_comment", "")
         self.config = AthenaSparkSessionConfig(
             parsed_model.get("config", {}),
             polling_interval=credentials.poll_interval,
@@ -209,6 +210,12 @@ class AthenaPythonJobHelper(PythonJobHelper):
             Any: The status of the session
         """
         return self.spark_connection.get_session_status(self.session_id)
+
+    def _prepend_query_comment(self, compiled_code: str) -> str:
+        if self.query_comment:
+            escaped = self.query_comment.replace("\\", "\\\\").replace('"', '\\"')
+            return f'spark.conf.set("dbt.query_comment", "{escaped}")\n{compiled_code}'
+        return compiled_code
 
     def submit(self, compiled_code: str) -> Any:
         """
@@ -379,6 +386,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
         # And with this handling, the run model code in target folder every model under run folder seems to be empty
         # Need to fix this work around solution
         if compiled_code.strip():
+            compiled_code = self._prepend_query_comment(compiled_code)
             while True:
                 try:
                     LOGGER.debug(
