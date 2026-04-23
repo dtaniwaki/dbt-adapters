@@ -226,6 +226,8 @@ class AthenaPythonJobHelper(PythonJobHelper):
         For Apache Spark version 3.5+, uses Spark Connect via
         GetSessionEndpoint.
         """
+        compiled_code = compiled_code.strip()
+        compiled_code = self._prepend_query_comment(compiled_code)
         if str(self.config.config.get("spark_engine_version", "")) == "3.5":
             return self._submit_spark_connect(compiled_code)
         return self._submit_calculation_api(compiled_code)
@@ -386,7 +388,6 @@ class AthenaPythonJobHelper(PythonJobHelper):
         # And with this handling, the run model code in target folder every model under run folder seems to be empty
         # Need to fix this work around solution
         if compiled_code.strip():
-            compiled_code = self._prepend_query_comment(compiled_code)
             while True:
                 try:
                     LOGGER.debug(

@@ -844,3 +844,15 @@ class TestPrependQueryComment:
 
         submitted_code = mock_athena_client.start_calculation_execution.call_args[1]["CodeBlock"]
         assert submitted_code == "x = 1"
+
+    def test_submit_passes_query_comment_to_spark_connect(self, mock_credentials):
+        """submit() prepends query comment to the code executed via Spark Connect."""
+        helper = self._make_helper(mock_credentials, query_comment="test_comment")
+        helper.config.config["spark_engine_version"] = "3.5"
+
+        with patch.object(helper, "_submit_spark_connect") as mock_sc:
+            helper.submit("x = 1")
+
+        submitted_code = mock_sc.call_args[0][0]
+        assert submitted_code.startswith('spark.conf.set("dbt.query_comment", "test_comment")')
+        assert "x = 1" in submitted_code

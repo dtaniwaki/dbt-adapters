@@ -33,6 +33,7 @@ from dbt.adapters.athena import AthenaConnectionManager
 from dbt.adapters.athena.column import AthenaColumn
 from dbt.adapters.athena.config import get_boto3_config
 from dbt.adapters.athena.connections import AthenaAdapterResponse, AthenaCursor
+from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.athena.constants import LOGGER
 from dbt.adapters.athena.exceptions import (
     S3LocationException,
