@@ -153,6 +153,10 @@ class AthenaSparkSessionManager:
                 evicted += 1
         return evicted
 
+    # How often (seconds) to re-check Athena for dead sessions while
+    # waiting for a pool slot.  Must be ≥ polling_interval.
+    _EVICTION_INTERVAL = 30.0
+
     def get_session_id(self, session_query_capacity: int = 1) -> str:
         """Get or wait for a Spark session within the ``spark_threads`` limit.
 
@@ -163,7 +167,7 @@ class AthenaSparkSessionManager:
           within ``self.timeout`` seconds.
         """
         timer: float = 0
-        eviction_done = False
+        time_since_eviction: float = self._EVICTION_INTERVAL  # evict on first pass
         while True:
             session_list = list(spark_session_list.items())
 
@@ -191,11 +195,11 @@ class AthenaSparkSessionManager:
                 self.set_spark_session_load(str(matching_session_id), 1)
                 return matching_session_id
 
-            # No available session. Before waiting, evict dead sessions once
-            # so that slots open up immediately (e.g. after idle timeout).
-            if not eviction_done:
+            # Periodically evict dead sessions (idle-timeout, terminated, etc.)
+            # so that pool slots open up without waiting for the full timeout.
+            if time_since_eviction >= self._EVICTION_INTERVAL:
                 evicted = self._evict_dead_sessions()
-                eviction_done = True
+                time_since_eviction = 0
                 if evicted > 0:
                     continue  # Re-check pool without sleeping
 
@@ -212,6 +216,7 @@ class AthenaSparkSessionManager:
             )
             time.sleep(self.polling_interval)
             timer += self.polling_interval
+            time_since_eviction += self.polling_interval
 
     def start_session(self) -> str:
         """
