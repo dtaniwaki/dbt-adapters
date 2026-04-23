@@ -33,6 +33,7 @@ from dbt.adapters.athena import AthenaConnectionManager
 from dbt.adapters.athena.column import AthenaColumn
 from dbt.adapters.athena.config import get_boto3_config
 from dbt.adapters.athena.connections import AthenaAdapterResponse, AthenaCursor
+from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.athena.constants import LOGGER
 from dbt.adapters.athena.exceptions import (
     S3LocationException,
@@ -1150,6 +1151,12 @@ class AthenaAdapter(SQLAdapter):
             code="OK",
             dpu_execution_in_millis=dpu_execution_in_millis,
         )
+
+    def submit_python_job(self, parsed_model: dict, compiled_code: str) -> AdapterResponse:
+        query_header = self.connections.query_header
+        if query_header and query_header.comment.query_comment:
+            parsed_model["query_comment"] = query_header.comment.query_comment.strip()
+        return super().submit_python_job(parsed_model, compiled_code)
 
     @property
     def default_python_submission_method(self) -> str:
