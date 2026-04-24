@@ -48,6 +48,9 @@ from dbt.adapters.sql import SQLConnectionManager
 @dataclass
 class AthenaAdapterResponse(AdapterResponse):
     data_scanned_in_bytes: Optional[int] = None
+    dpu_execution_in_millis: Optional[int] = None
+    spark_session_id: Optional[str] = None
+    spark_calculation_execution_id: Optional[str] = None
 
 
 @dataclass
@@ -70,6 +73,7 @@ class AthenaCredentials(Credentials):
     s3_data_dir: Optional[str] = None
     s3_data_naming: str = "schema_table_unique"
     spark_work_group: Optional[str] = None
+    spark_connect_max_sessions: Optional[int] = None
     s3_tmp_table_dir: Optional[str] = None
     # Unfortunately we can not just use dict, must be Dict because we'll get the following error:
     # Credentials in profile "athena", target "athena" invalid: Unable to create schema for 'dict'
@@ -107,6 +111,7 @@ class AthenaCredentials(Credentials):
             "seed_s3_upload_args",
             "lf_tags_database",
             "spark_work_group",
+            "spark_connect_max_sessions",
         )
 
 
@@ -333,6 +338,21 @@ class AthenaConnectionManager(SQLConnectionManager):
                 LOGGER.debug(f"There was an error parsing query stats {err}")
                 return -1, 0
         return cursor.rowcount, cursor.data_scanned_in_bytes
+
+    def cleanup_all(self) -> None:
+        # Terminate Spark Connect sessions owned by THIS invocation so DPUs
+        # are released immediately instead of waiting for idle timeout.
+        # Scoping by invocation id prevents multi-invocation hosts (dbt Cloud
+        # workers, test harnesses) from killing sessions belonging to other
+        # live invocations that share the singleton pool.
+        from dbt_common.invocation import get_invocation_id
+
+        from dbt.adapters.athena.spark_connect_session import (
+            SparkConnectSessionPool,
+        )
+
+        SparkConnectSessionPool().terminate_by_invocation(get_invocation_id())
+        super().cleanup_all()
 
     def cancel(self, connection: Connection) -> None:
         pass

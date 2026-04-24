@@ -1,17 +1,214 @@
+import json
+import os
+import random
+import threading
 import time
+import traceback
 from functools import cached_property
-from typing import Any, Dict
+from hashlib import md5
+from typing import Any, Dict, Optional
 
 import botocore
 from dbt_common.exceptions import DbtRuntimeError
+from dbt_common.invocation import get_invocation_id
 
 from dbt.adapters.athena.config import AthenaSparkSessionConfig
 from dbt.adapters.athena.connections import AthenaCredentials
-from dbt.adapters.athena.constants import LOGGER
+from dbt.adapters.athena.constants import DEFAULT_SPARK_CONNECT_MAX_SESSIONS, LOGGER
 from dbt.adapters.athena.session import AthenaSparkSessionManager
+from dbt.adapters.athena.spark_connect_session import SparkConnectSessionPool
 from dbt.adapters.base import PythonJobHelper
 
 SUBMISSION_LANGUAGE = "python"
+
+# GetSessionEndpoint returns an AuthToken that expires after ~29 minutes;
+# refresh when fewer than this many seconds remain so a long-running gRPC
+# call never attaches an expired token.
+_TOKEN_REFRESH_MARGIN_SECONDS = 120
+
+# Max retry attempts for transient Spark Connect errors.
+_SPARK_CONNECT_MAX_RETRIES = 3
+
+# Upper bound on how long to wait for GetSessionEndpoint to return a ready
+# endpoint before giving up.  Kept separate from ``self.timeout`` so endpoint
+# wait cannot consume the entire execution budget.
+_ENDPOINT_READY_TIMEOUT_SECONDS = 180
+
+# Patterns that indicate a transient Spark Connect error where retrying
+# with a new session is expected to succeed.  String matching is fragile —
+# pyspark wording may drift between versions — so ``_is_transient_spark_error``
+# also inspects gRPC status codes when available.
+_TRANSIENT_SPARK_PATTERNS = [
+    # Spark executor failed to obtain credentials from the provider chain
+    # (observed when many sessions start concurrently).
+    "Unable to load credentials",
+    # Spark executor failed to resolve the AWS region via
+    # DefaultAwsRegionProviderChain (IMDS not yet available at executor startup).
+    "Unable to load region",
+    # gRPC connection pool was shut down (secondary failure after a session
+    # error).  A new session creates a fresh pool.
+    "Pool not running",
+    # Athena terminated the Spark session (idle timeout, DPU pressure, or
+    # concurrent session limit).  A new session resolves this.
+    "Session not active",
+    # Athena rejected start_session because the account/workgroup session
+    # quota is exhausted.  Retrying after other sessions finish is expected.
+    "Maximum allowed sessions",
+]
+
+# gRPC status codes (by name) that we treat as transient.  Checked
+# structurally via ``grpc.RpcError.code()`` so wording changes do not defeat
+# retry behavior.
+_TRANSIENT_GRPC_STATUS_CODES = frozenset(
+    {"UNAVAILABLE", "DEADLINE_EXCEEDED", "ABORTED", "RESOURCE_EXHAUSTED"}
+)
+
+
+def _is_transient_spark_error(e: BaseException) -> bool:
+    """Return True if the exception is a transient Spark Connect error.
+
+    Prefer gRPC status code when the exception exposes one; fall back to
+    substring matching against known pyspark/Athena messages.
+    """
+    # gRPC errors may be wrapped by pyspark; walk the chain.
+    current: Optional[BaseException] = e
+    while current is not None:
+        code_fn = getattr(current, "code", None)
+        if callable(code_fn):
+            try:
+                code = code_fn()
+            except Exception:  # noqa: BLE001 - not a gRPC error
+                code = None
+            if code is not None and getattr(code, "name", None) in _TRANSIENT_GRPC_STATUS_CODES:
+                return True
+        current = current.__cause__ or current.__context__
+
+    error_str = f"{type(e).__name__}: {e}"
+    return any(p in error_str for p in _TRANSIENT_SPARK_PATTERNS)
+
+
+# Setting SPARK_CONNECT_MODE_ENABLED is deferred to first submit() rather
+# than module import so importing this module never mutates the environment
+# of processes that don't actually use Spark Connect (e.g. pure Calculations
+# API workflows, test harnesses).
+_spark_connect_env_lock = threading.Lock()
+_spark_connect_env_set = False
+
+
+def _ensure_spark_connect_env() -> None:
+    """Enable Spark Connect mode for the process (idempotent).
+
+    Deferred until the first Spark Connect submission — see module-level
+    comment for why this is not done at import time.
+    """
+    global _spark_connect_env_set
+    if _spark_connect_env_set:
+        return
+    with _spark_connect_env_lock:
+        if not _spark_connect_env_set:
+            os.environ["SPARK_CONNECT_MODE_ENABLED"] = "1"
+            _spark_connect_env_set = True
+
+
+# Cache for the dynamically-built AthenaChannelBuilder class.  pyspark is
+# imported lazily so this module stays importable without Spark 3.5.
+_athena_channel_builder_cls: Any = None
+_athena_channel_builder_cls_lock = threading.Lock()
+
+
+def _get_athena_channel_builder_cls() -> Any:
+    global _athena_channel_builder_cls
+    if _athena_channel_builder_cls is not None:
+        return _athena_channel_builder_cls
+    with _athena_channel_builder_cls_lock:
+        if _athena_channel_builder_cls is not None:
+            return _athena_channel_builder_cls
+
+        from datetime import datetime, timezone
+
+        from pyspark.sql.connect.client.core import ChannelBuilder
+
+        class AthenaChannelBuilder(ChannelBuilder):
+            def __init__(
+                self,
+                client: Any,
+                sid: str,
+                url: str,
+                auth_token: Optional[str],
+                token_expiry: Any,
+            ) -> None:
+                sc_url = url.replace("https://", "sc://", 1) + ":443/;use_ssl=true"
+                super().__init__(sc_url)
+                self._athena_client = client
+                self._athena_session_id = sid
+                self._auth_token = auth_token
+                self._token_expiry = token_expiry
+                # gRPC calls ``metadata()`` from executor threads; serialize
+                # read-modify-write of the token to avoid racing refreshes.
+                self._token_lock = threading.Lock()
+
+            def _refresh_token_if_needed(self) -> None:
+                # Double-checked locking: cheap read outside the lock, then
+                # recheck under the lock so at most one thread issues the
+                # refresh call.
+                if self._token_is_fresh():
+                    return
+                with self._token_lock:
+                    if self._token_is_fresh():
+                        return
+                    response = self._athena_client.get_session_endpoint(
+                        SessionId=self._athena_session_id
+                    )
+                    auth_token = response.get("AuthToken")
+                    if not auth_token:
+                        raise DbtRuntimeError(
+                            f"GetSessionEndpoint returned no AuthToken for session "
+                            f"{self._athena_session_id}"
+                        )
+                    self._auth_token = auth_token
+                    self._token_expiry = response.get("AuthTokenExpirationTime")
+
+            def _token_is_fresh(self) -> bool:
+                if not (self._auth_token and self._token_expiry):
+                    return False
+                remaining = (self._token_expiry - datetime.now(timezone.utc)).total_seconds()
+                return remaining > _TOKEN_REFRESH_MARGIN_SECONDS
+
+            def metadata(self) -> Any:
+                self._refresh_token_if_needed()
+                with self._token_lock:
+                    token = self._auth_token
+                base = [(k, v) for k, v in super().metadata() if k != "x-aws-proxy-auth"]
+                base.append(("x-aws-proxy-auth", token))
+                return base
+
+        _athena_channel_builder_cls = AthenaChannelBuilder
+        return _athena_channel_builder_cls
+
+
+def _create_athena_channel_builder(
+    athena_client: Any,
+    session_id: str,
+    endpoint_url: str,
+    initial_auth_token: Optional[str] = None,
+    initial_token_expiry: Any = None,
+) -> Any:
+    """Build a ChannelBuilder that auto-refreshes the Athena AuthToken.
+
+    The AuthToken returned by GetSessionEndpoint expires after ~29 minutes.
+    This builder calls GetSessionEndpoint to obtain a fresh token whenever
+    the current token is about to expire, so long-running Spark Connect
+    jobs are not interrupted by PERMISSION_DENIED errors.  Imports pyspark
+    lazily so the module stays importable without the Spark 3.5 runtime.
+    """
+    cls = _get_athena_channel_builder_cls()
+    return cls(
+        athena_client,
+        session_id,
+        endpoint_url,
+        initial_auth_token,
+        initial_token_expiry,
+    )
 
 
 class AthenaPythonJobHelper(PythonJobHelper):
@@ -31,6 +228,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
             credentials (AthenaCredentials): Credentials for Athena connection.
         """
         self.relation_name = parsed_model.get("relation_name", None)
+        self.credentials = credentials
         self.config = AthenaSparkSessionConfig(
             parsed_model.get("config", {}),
             polling_interval=credentials.poll_interval,
@@ -94,6 +292,53 @@ class AthenaPythonJobHelper(PythonJobHelper):
         """
         return self.spark_connection.athena_client
 
+    @cached_property
+    def _is_spark_connect(self) -> bool:
+        """True when the model requests Apache Spark 3.5+ via Spark Connect."""
+        return str(self.config.config.get("spark_engine_version", "")) == "3.5"
+
+    @cached_property
+    def _spark_connect_pool(self) -> SparkConnectSessionPool:
+        return SparkConnectSessionPool()
+
+    @cached_property
+    def _session_fingerprint(self) -> str:
+        """md5 of engine config + workgroup + engine version.
+
+        Sessions with matching fingerprint may be reused across models.
+        Workgroup and engine version are included so two models that differ
+        only in those attributes never accidentally share a session.
+        """
+        payload = {
+            "engine_config": self.engine_config,
+            "spark_work_group": self.credentials.spark_work_group,
+            "spark_engine_version": str(self.config.config.get("spark_engine_version", "")),
+        }
+        return md5(
+            json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+    @cached_property
+    def _session_key(self) -> tuple:
+        return (get_invocation_id(), self._session_fingerprint)
+
+    @cached_property
+    def _spark_connect_max_sessions(self) -> int:
+        configured = getattr(self.credentials, "spark_connect_max_sessions", None)
+        if configured is None:
+            return DEFAULT_SPARK_CONNECT_MAX_SESSIONS
+        value = int(configured)
+        if value < 1:
+            raise DbtRuntimeError(
+                f"spark_connect_max_sessions must be >= 1 (got {value}). "
+                "Omit the field to use the default."
+            )
+        return value
+
+    def _session_description(self) -> str:
+        invocation = get_invocation_id()
+        return f"dbt: {invocation} - {self._session_fingerprint}"
+
     def get_current_session_status(self) -> Any:
         """
         Get the current session status.
@@ -107,22 +352,23 @@ class AthenaPythonJobHelper(PythonJobHelper):
         """
         Submit a calculation to Athena.
 
-        This function submits a calculation to Athena for execution using the provided compiled code.
-        It starts a calculation execution with the current session ID and the compiled code as the code block.
-        The function then polls until the calculation execution is completed, and retrieves the result.
-        If the execution is successful and completed, the result S3 URI is returned. Otherwise, a DbtRuntimeError
-        is raised with the execution status.
+        For PySpark engine version 3, executes via the Calculations API
+        (StartCalculationExecution).  For Apache Spark 3.5+, executes via
+        Spark Connect over a gRPC channel obtained from GetSessionEndpoint.
 
         Args:
             compiled_code (str): The compiled code to submit for execution.
 
         Returns:
-            dict: The result S3 URI if the execution is successful and completed.
+            dict: The execution result.
 
         Raises:
             DbtRuntimeError: If the execution ends in a state other than "COMPLETED".
 
         """
+        if self._is_spark_connect:
+            return self._submit_spark_connect(compiled_code)
+
         # Seeing an empty calculation along with main python model code calculation is submitted for almost every model
         # Also, if not returning the result json, we are getting green ERROR messages instead of OK messages.
         # And with this handling, the run model code in target folder every model under run folder seems to be empty
@@ -173,20 +419,269 @@ class AthenaPythonJobHelper(PythonJobHelper):
             )
             if execution_status == "COMPLETED":
                 try:
-                    result = self.athena_client.get_calculation_execution(
+                    execution_response = self.athena_client.get_calculation_execution(
                         CalculationExecutionId=calculation_execution_id
-                    )["Result"]
+                    )
+                    result = execution_response.get("Result") or {}
+                    statistics = execution_response.get("Statistics")
+                    if statistics is not None:
+                        result["Statistics"] = statistics
+                    result["SparkSessionId"] = self.session_id
+                    result["SparkCalculationExecutionId"] = calculation_execution_id
                 except Exception as e:
                     LOGGER.error(f"Unable to retrieve results: Got: {e}")
-                    result = {}
+                    # Preserve identifiers so CloudWatch / Athena console can
+                    # still be used to debug the failed fetch.
+                    result = {
+                        "SparkSessionId": self.session_id,
+                        "SparkCalculationExecutionId": calculation_execution_id,
+                    }
             return result
         else:
+            # dbt submits an empty "ghost" calculation alongside every python
+            # model to keep the adapter response shape consistent.  This
+            # branch returns placeholder data without hitting Athena.
             return {
                 "ResultS3Uri": "string",
                 "ResultType": "string",
                 "StdErrorS3Uri": "string",
                 "StdOutS3Uri": "string",
+                "SparkSessionId": self.session_id,
+                "SparkCalculationExecutionId": None,
             }
+
+    def _acquire_spark_connect_session(self) -> str:
+        """Acquire a Spark Connect session from the pool."""
+        spark_work_group = self.credentials.spark_work_group
+        if not spark_work_group:
+            # Spark Connect cannot target an Athena workgroup if none is
+            # configured; fail fast with a clear message rather than letting
+            # boto3 surface a less helpful validation error.
+            raise DbtRuntimeError(
+                "spark_work_group must be set in the Athena profile to submit "
+                "python models via Spark Connect (spark_engine_version=3.5)."
+            )
+        return self._spark_connect_pool.acquire(
+            key=self._session_key,
+            athena_client=self.athena_client,
+            spark_work_group=spark_work_group,
+            engine_config=self.engine_config,
+            session_description=self._session_description(),
+            max_sessions=self._spark_connect_max_sessions,
+            timeout=self.timeout,
+            polling_interval=self.polling_interval,
+        )
+
+    def _wait_for_endpoint(self, session_id: str) -> Dict[str, Any]:
+        """Poll GetSessionEndpoint until the endpoint is ready.
+
+        Bounded by ``min(self.timeout, _ENDPOINT_READY_TIMEOUT_SECONDS)`` so
+        slow endpoint provisioning cannot consume the full execution budget
+        reserved for user code.
+        """
+        deadline_seconds = min(self.timeout, _ENDPOINT_READY_TIMEOUT_SECONDS)
+        timer: float = 0
+        throttle_backoff: float = 0
+        while True:
+            try:
+                response = self.athena_client.get_session_endpoint(SessionId=session_id)
+                endpoint_url = response.get("EndpointUrl")
+                if endpoint_url:
+                    if not response.get("AuthToken"):
+                        raise DbtRuntimeError(
+                            f"GetSessionEndpoint returned no AuthToken for session {session_id}"
+                        )
+                    return response
+                throttle_backoff = 0
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "ThrottlingException":
+                    throttle_backoff = min((throttle_backoff or 1) * 2, 30) + random.uniform(0, 1)
+                    LOGGER.debug(
+                        f"Session {session_id} endpoint throttled, "
+                        f"backing off {throttle_backoff:.1f}s"
+                    )
+                else:
+                    throttle_backoff = 0
+                    LOGGER.debug(f"Waiting for session {session_id} endpoint: {e}")
+
+            if timer >= deadline_seconds:
+                raise DbtRuntimeError(
+                    f"Session {session_id} endpoint did not become ready within "
+                    f"{deadline_seconds}s (endpoint-wait deadline, not execution "
+                    f"timeout)"
+                )
+            sleep_time = throttle_backoff if throttle_backoff else self.polling_interval
+            time.sleep(sleep_time)
+            timer += sleep_time
+
+    def _submit_spark_connect(self, compiled_code: str) -> Any:
+        """Submit code via Spark Connect (Apache Spark 3.5+).
+
+        Transient Spark Connect errors (credential propagation failures,
+        gRPC pool shutdown) are retried with a new session up to
+        ``_SPARK_CONNECT_MAX_RETRIES`` times.  ``self.timeout`` is a hard
+        execution-time limit that covers both endpoint wait and code
+        execution.
+
+        Empty ``compiled_code`` bypasses both Athena and the session pool —
+        dbt submits a "ghost" empty calculation alongside every python
+        model and we have nothing to run.  No session is acquired in this
+        case because starting one would cost DPUs for no benefit; models
+        with real code will still fingerprint-match and share a session
+        via the pool.
+        """
+        if not compiled_code.strip():
+            return {"SparkConnect": True, "SparkSessionId": None}
+
+        _ensure_spark_connect_env()
+        start_time = time.monotonic()
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(1, _SPARK_CONNECT_MAX_RETRIES + 1):
+            result, last_error, done = self._spark_connect_attempt(
+                compiled_code, attempt, start_time
+            )
+            if done:
+                return result
+
+            is_last_attempt = attempt >= _SPARK_CONNECT_MAX_RETRIES
+            if is_last_attempt:
+                break
+
+            backoff = min(2**attempt, 30) + random.uniform(0, 1)
+            LOGGER.warning(
+                f"Model {self.relation_name} - Transient Spark Connect error "
+                f"(attempt {attempt}/{_SPARK_CONNECT_MAX_RETRIES}), "
+                f"retrying in {backoff:.1f}s with new session: "
+                f"{type(last_error).__name__}: {last_error}"
+            )
+            time.sleep(backoff)
+
+        # All retries exhausted — re-raise the last error with a wrapping
+        # message so operators can distinguish "failed once" from "failed
+        # after N attempts".
+        raise DbtRuntimeError(
+            f"Spark Connect execution failed after {_SPARK_CONNECT_MAX_RETRIES} "
+            f"attempts: {type(last_error).__name__}: {last_error}"
+        ) from last_error
+
+    def _spark_connect_attempt(
+        self,
+        compiled_code: str,
+        attempt: int,
+        start_time: float,
+    ) -> "tuple[Any, Optional[BaseException], bool]":
+        """Run one Spark Connect attempt.
+
+        Returns ``(result, error, done)``:
+          * ``done=True, result=<dict>`` — success, caller should return result.
+          * ``done=False, error=<exc>`` — transient failure, caller may retry.
+
+        Non-retriable failures and timeouts raise directly (caller sees the
+        exception instead of a return value).
+
+        Session lifecycle: on transient failure the session is terminated
+        (it is likely broken); on success or acquire failure it is released
+        back to the pool for reuse.
+        """
+        session_id = self._acquire_spark_connect_session()
+        spark = None
+        timer: Optional[threading.Timer] = None
+        timeout_event = threading.Event()
+        terminate_session = False
+
+        try:
+            remaining = self.timeout - (time.monotonic() - start_time)
+            if remaining <= 0:
+                raise DbtRuntimeError(
+                    f"Spark Connect execution timed out after {self.timeout} seconds."
+                )
+
+            response = self._wait_for_endpoint(session_id)
+            channel_builder = _create_athena_channel_builder(
+                self.athena_client,
+                session_id,
+                response["EndpointUrl"],
+                initial_auth_token=response.get("AuthToken"),
+                initial_token_expiry=response.get("AuthTokenExpirationTime"),
+            )
+
+            from pyspark.sql.connect.session import (
+                SparkSession as ConnectSparkSession,
+            )
+
+            spark = ConnectSparkSession.builder.channelBuilder(channel_builder).create()
+
+            remaining = self.timeout - (time.monotonic() - start_time)
+            if remaining <= 0:
+                raise DbtRuntimeError(
+                    f"Spark Connect execution timed out after {self.timeout} seconds."
+                )
+
+            def _on_timeout() -> None:
+                timeout_event.set()
+                LOGGER.warning(
+                    f"Model {self.relation_name} - " f"Execution timed out after {self.timeout}s"
+                )
+                if spark is not None:
+                    spark.interruptAll()
+
+            timer = threading.Timer(remaining, _on_timeout)
+            timer.start()
+
+            exec_globals: Dict[str, Any] = {"spark": spark}
+            exec(compiled_code, exec_globals)  # noqa: S102 - user model code
+            return (
+                {"SparkConnect": True, "SparkSessionId": session_id},
+                None,
+                True,
+            )
+        except DbtRuntimeError:
+            raise
+        except Exception as e:
+            if timeout_event.is_set():
+                raise DbtRuntimeError(
+                    f"Spark Connect execution timed out after {self.timeout} seconds."
+                ) from e
+
+            transient = _is_transient_spark_error(e)
+            is_last_attempt = attempt >= _SPARK_CONNECT_MAX_RETRIES
+
+            if transient:
+                # Terminate the broken session whether or not we retry:
+                # leaving it in the pool risks a later model reusing it and
+                # hitting the same failure ("Session not active" etc.).
+                terminate_session = True
+
+            if not transient or is_last_attempt:
+                LOGGER.error(
+                    f"Model {self.relation_name} - Spark Connect execution failed "
+                    f"(attempt {attempt}/{_SPARK_CONNECT_MAX_RETRIES}): "
+                    f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                )
+                if not transient:
+                    raise DbtRuntimeError(
+                        f"Spark Connect execution failed: {type(e).__name__}: {e}"
+                    ) from e
+
+            # Transient + not last attempt → let the caller retry with a new
+            # session.
+            return (None, e, False)
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if spark is not None:
+                try:
+                    spark.stop()
+                except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                    LOGGER.debug(f"Ignoring error while stopping Spark session: {e}")
+            if terminate_session:
+                # Terminate the failed session so DPUs are released;
+                # the next attempt acquires a fresh one from the pool.
+                self._spark_connect_pool.terminate_and_remove(session_id)
+            else:
+                self._spark_connect_pool.release(session_id)
 
     def poll_until_session_idle(self) -> None:
         """
