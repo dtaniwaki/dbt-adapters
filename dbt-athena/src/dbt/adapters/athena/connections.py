@@ -80,6 +80,26 @@ class AthenaCredentials(Credentials):
     seed_s3_upload_args: Optional[Dict[str, Any]] = None
     lf_tags_database: Optional[Dict[str, str]] = None
 
+    def __post_init__(self) -> None:
+        # Surface mis-configured spark_connect_max_sessions at profile-load
+        # time rather than waiting until a python model runs — the misconfig
+        # would otherwise only manifest once a Spark 3.5 model is submitted,
+        # potentially minutes into a long dbt run.
+        if self.spark_connect_max_sessions is not None:
+            try:
+                value = int(self.spark_connect_max_sessions)
+            except (TypeError, ValueError) as e:
+                raise DbtRuntimeError(
+                    f"spark_connect_max_sessions must be an integer (got "
+                    f"{self.spark_connect_max_sessions!r})."
+                ) from e
+            if value < 1:
+                raise DbtRuntimeError(
+                    f"spark_connect_max_sessions must be >= 1 (got {value}). "
+                    "Omit the field to use the default."
+                )
+            self.spark_connect_max_sessions = value
+
     @property
     def type(self) -> str:
         return "athena"
@@ -345,6 +365,11 @@ class AthenaConnectionManager(SQLConnectionManager):
         # Scoping by invocation id prevents multi-invocation hosts (dbt Cloud
         # workers, test harnesses) from killing sessions belonging to other
         # live invocations that share the singleton pool.
+        #
+        # ``spark_connect_session`` is imported lazily because it pulls in the
+        # pyspark runtime lookup path; importing at module load time would
+        # force every user of the Athena connection manager (including pure
+        # SQL workflows) to pay for Spark imports.
         from dbt_common.invocation import get_invocation_id
 
         from dbt.adapters.athena.spark_connect_session import (

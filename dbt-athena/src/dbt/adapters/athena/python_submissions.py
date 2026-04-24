@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import random
@@ -6,7 +7,7 @@ import time
 import traceback
 from functools import cached_property
 from hashlib import md5
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, NamedTuple, Optional
 
 import botocore
 from dbt_common.exceptions import DbtRuntimeError
@@ -64,15 +65,33 @@ _TRANSIENT_GRPC_STATUS_CODES = frozenset(
 )
 
 
+class _AttemptResult(NamedTuple):
+    """Outcome of a single Spark Connect submission attempt.
+
+    ``done=True`` means the caller should return ``result`` immediately.
+    ``done=False`` means a transient failure was captured in ``error`` and
+    the caller may retry with a new session.
+    """
+
+    result: Optional[Dict[str, Any]]
+    error: Optional[BaseException]
+    done: bool
+
+
 def _is_transient_spark_error(e: BaseException) -> bool:
     """Return True if the exception is a transient Spark Connect error.
 
     Prefer gRPC status code when the exception exposes one; fall back to
     substring matching against known pyspark/Athena messages.
     """
-    # gRPC errors may be wrapped by pyspark; walk the chain.
+    # gRPC errors may be wrapped by pyspark; walk the chain.  Track seen
+    # exception identities to handle the rare case of a self-referential
+    # ``__cause__`` / ``__context__`` cycle introduced by pathological user
+    # code or instrumentation wrappers.
+    seen: set = set()
     current: Optional[BaseException] = e
-    while current is not None:
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
         code_fn = getattr(current, "code", None)
         if callable(code_fn):
             try:
@@ -87,27 +106,22 @@ def _is_transient_spark_error(e: BaseException) -> bool:
     return any(p in error_str for p in _TRANSIENT_SPARK_PATTERNS)
 
 
-# Setting SPARK_CONNECT_MODE_ENABLED is deferred to first submit() rather
-# than module import so importing this module never mutates the environment
-# of processes that don't actually use Spark Connect (e.g. pure Calculations
-# API workflows, test harnesses).
-_spark_connect_env_lock = threading.Lock()
-_spark_connect_env_set = False
-
-
-def _ensure_spark_connect_env() -> None:
-    """Enable Spark Connect mode for the process (idempotent).
-
-    Deferred until the first Spark Connect submission — see module-level
-    comment for why this is not done at import time.
-    """
-    global _spark_connect_env_set
-    if _spark_connect_env_set:
-        return
-    with _spark_connect_env_lock:
-        if not _spark_connect_env_set:
-            os.environ["SPARK_CONNECT_MODE_ENABLED"] = "1"
-            _spark_connect_env_set = True
+# SPARK_CONNECT_MODE_ENABLED influences how ``pyspark.sql.SparkSession``
+# builder resolves when user model code falls back to the generic SparkSession
+# API instead of our injected ``spark`` object.  We scope this per-exec so
+# the adapter never permanently pollutes the host process environment (which
+# would affect unrelated pyspark usage in multi-tenant workers like dbt Cloud).
+@contextlib.contextmanager
+def _spark_connect_mode_enabled() -> Iterator[None]:
+    previous = os.environ.get("SPARK_CONNECT_MODE_ENABLED")
+    os.environ["SPARK_CONNECT_MODE_ENABLED"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("SPARK_CONNECT_MODE_ENABLED", None)
+        else:
+            os.environ["SPARK_CONNECT_MODE_ENABLED"] = previous
 
 
 # Cache for the dynamically-built AthenaChannelBuilder class.  pyspark is
@@ -129,6 +143,17 @@ def _get_athena_channel_builder_cls() -> Any:
         from pyspark.sql.connect.client.core import ChannelBuilder
 
         class AthenaChannelBuilder(ChannelBuilder):
+            """pyspark ChannelBuilder with Athena-specific AuthToken refresh.
+
+            ``metadata()`` is invoked from pyspark gRPC executor threads on
+            every outgoing call, potentially concurrently.  Each call must
+            attach a current ``x-aws-proxy-auth`` header — Athena issues
+            tokens that expire in ~29 minutes, so long-running jobs must
+            refresh on their own.  This class serialises refreshes with
+            double-checked locking and preserves the parent-class header
+            set.
+            """
+
             def __init__(
                 self,
                 client: Any,
@@ -176,11 +201,15 @@ def _get_athena_channel_builder_cls() -> Any:
 
             def metadata(self) -> Any:
                 self._refresh_token_if_needed()
+                # Hold the lock across both the token read and the
+                # super().metadata() call: pyspark's ChannelBuilder does not
+                # publicly commit to metadata() being pure, so serialising
+                # keeps us safe against future implementation changes.
                 with self._token_lock:
                     token = self._auth_token
-                base = [(k, v) for k, v in super().metadata() if k != "x-aws-proxy-auth"]
-                base.append(("x-aws-proxy-auth", token))
-                return base
+                    base = [(k, v) for k, v in super().metadata() if k != "x-aws-proxy-auth"]
+                    base.append(("x-aws-proxy-auth", token))
+                    return base
 
         _athena_channel_builder_cls = AthenaChannelBuilder
         return _athena_channel_builder_cls
@@ -314,8 +343,11 @@ class AthenaPythonJobHelper(PythonJobHelper):
             "spark_work_group": self.credentials.spark_work_group,
             "spark_engine_version": str(self.config.config.get("spark_engine_version", "")),
         }
+        # ``usedforsecurity=False`` is required on FIPS-enforced Python builds
+        # (e.g. RHEL in FIPS mode); md5 here is purely a session-key fingerprint.
         return md5(
-            json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")
+            json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8"),
+            usedforsecurity=False,
         ).hexdigest()
 
     @cached_property
@@ -324,16 +356,12 @@ class AthenaPythonJobHelper(PythonJobHelper):
 
     @cached_property
     def _spark_connect_max_sessions(self) -> int:
+        # AthenaCredentials.__post_init__ already validates type and range,
+        # so here we only apply the default when the user didn't set it.
         configured = getattr(self.credentials, "spark_connect_max_sessions", None)
         if configured is None:
             return DEFAULT_SPARK_CONNECT_MAX_SESSIONS
-        value = int(configured)
-        if value < 1:
-            raise DbtRuntimeError(
-                f"spark_connect_max_sessions must be >= 1 (got {value}). "
-                "Omit the field to use the default."
-            )
-        return value
+        return int(configured)
 
     def _session_description(self) -> str:
         invocation = get_invocation_id()
@@ -481,29 +509,42 @@ class AthenaPythonJobHelper(PythonJobHelper):
         """
         deadline_seconds = min(self.timeout, _ENDPOINT_READY_TIMEOUT_SECONDS)
         timer: float = 0
-        throttle_backoff: float = 0
+        # ``throttle_base`` is the exponential-backoff base (without jitter),
+        # so successive throttles compute 1→2→4→…→30 rather than doubling a
+        # jittered value that drifts unpredictably.
+        throttle_base: float = 0
         while True:
+            throttled = False
             try:
                 response = self.athena_client.get_session_endpoint(SessionId=session_id)
                 endpoint_url = response.get("EndpointUrl")
                 if endpoint_url:
                     if not response.get("AuthToken"):
-                        raise DbtRuntimeError(
-                            f"GetSessionEndpoint returned no AuthToken for session {session_id}"
+                        # Retry instead of failing fast: Athena occasionally
+                        # returns an endpoint_url a moment before AuthToken
+                        # is populated.
+                        LOGGER.debug(
+                            f"Session {session_id} endpoint returned without AuthToken, "
+                            f"retrying"
                         )
-                    return response
-                throttle_backoff = 0
+                    else:
+                        return response
             except botocore.exceptions.ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code", "")
                 if error_code == "ThrottlingException":
-                    throttle_backoff = min((throttle_backoff or 1) * 2, 30) + random.uniform(0, 1)
+                    throttled = True
+                    throttle_base = min(max(throttle_base, 1) * 2, 30)
                     LOGGER.debug(
                         f"Session {session_id} endpoint throttled, "
-                        f"backing off {throttle_backoff:.1f}s"
+                        f"backing off ~{throttle_base:.1f}s"
                     )
                 else:
-                    throttle_backoff = 0
                     LOGGER.debug(f"Waiting for session {session_id} endpoint: {e}")
+
+            if not throttled:
+                # Non-throttle path (success-without-token or transient error):
+                # reset the backoff so we don't inherit stale pressure.
+                throttle_base = 0
 
             if timer >= deadline_seconds:
                 raise DbtRuntimeError(
@@ -511,7 +552,9 @@ class AthenaPythonJobHelper(PythonJobHelper):
                     f"{deadline_seconds}s (endpoint-wait deadline, not execution "
                     f"timeout)"
                 )
-            sleep_time = throttle_backoff if throttle_backoff else self.polling_interval
+            sleep_time = (
+                throttle_base + random.uniform(0, 1) if throttled else self.polling_interval
+            )
             time.sleep(sleep_time)
             timer += sleep_time
 
@@ -534,22 +577,32 @@ class AthenaPythonJobHelper(PythonJobHelper):
         if not compiled_code.strip():
             return {"SparkConnect": True, "SparkSessionId": None}
 
-        _ensure_spark_connect_env()
         start_time = time.monotonic()
         last_error: Optional[BaseException] = None
 
         for attempt in range(1, _SPARK_CONNECT_MAX_RETRIES + 1):
-            result, last_error, done = self._spark_connect_attempt(
-                compiled_code, attempt, start_time
-            )
-            if done:
-                return result
+            outcome = self._spark_connect_attempt(compiled_code, attempt, start_time)
+            if outcome.done:
+                return outcome.result
+            last_error = outcome.error
 
             is_last_attempt = attempt >= _SPARK_CONNECT_MAX_RETRIES
             if is_last_attempt:
                 break
 
             backoff = min(2**attempt, 30) + random.uniform(0, 1)
+            remaining = self.timeout - (time.monotonic() - start_time)
+            if backoff >= remaining:
+                # No budget left to retry; surface the last error as
+                # "failed after N attempts" rather than silently sleeping
+                # past the execution timeout.
+                LOGGER.warning(
+                    f"Model {self.relation_name} - Transient Spark Connect error on "
+                    f"attempt {attempt}/{_SPARK_CONNECT_MAX_RETRIES}, "
+                    f"but remaining budget ({remaining:.1f}s) is below backoff "
+                    f"({backoff:.1f}s); giving up."
+                )
+                break
             LOGGER.warning(
                 f"Model {self.relation_name} - Transient Spark Connect error "
                 f"(attempt {attempt}/{_SPARK_CONNECT_MAX_RETRIES}), "
@@ -571,10 +624,10 @@ class AthenaPythonJobHelper(PythonJobHelper):
         compiled_code: str,
         attempt: int,
         start_time: float,
-    ) -> "tuple[Any, Optional[BaseException], bool]":
+    ) -> "_AttemptResult":
         """Run one Spark Connect attempt.
 
-        Returns ``(result, error, done)``:
+        Returns an ``_AttemptResult`` whose semantics are:
           * ``done=True, result=<dict>`` — success, caller should return result.
           * ``done=False, error=<exc>`` — transient failure, caller may retry.
 
@@ -631,11 +684,12 @@ class AthenaPythonJobHelper(PythonJobHelper):
             timer.start()
 
             exec_globals: Dict[str, Any] = {"spark": spark}
-            exec(compiled_code, exec_globals)  # noqa: S102 - user model code
-            return (
-                {"SparkConnect": True, "SparkSessionId": session_id},
-                None,
-                True,
+            with _spark_connect_mode_enabled():
+                exec(compiled_code, exec_globals)  # noqa: S102 - user model code
+            return _AttemptResult(
+                result={"SparkConnect": True, "SparkSessionId": session_id},
+                error=None,
+                done=True,
             )
         except DbtRuntimeError:
             raise
@@ -667,10 +721,14 @@ class AthenaPythonJobHelper(PythonJobHelper):
 
             # Transient + not last attempt → let the caller retry with a new
             # session.
-            return (None, e, False)
+            return _AttemptResult(result=None, error=e, done=False)
         finally:
+            # Cancel the watchdog timer first and wait for any already-fired
+            # callback to finish.  Otherwise spark.interruptAll() running in
+            # the timer thread can race with spark.stop() below.
             if timer is not None:
                 timer.cancel()
+                timer.join(timeout=5)
             if spark is not None:
                 try:
                     spark.stop()

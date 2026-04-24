@@ -136,49 +136,19 @@ class AthenaSparkSessionConfig:
         spark_engine_version = str(self.config.get("spark_engine_version", ""))
         is_spark_35 = spark_engine_version == "3.5"
 
-        default_engine_config: Dict[str, Any] = {
-            "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
-        }
-        if not is_spark_35:
-            default_engine_config["CoordinatorDpuSize"] = DEFAULT_SPARK_COORDINATOR_DPU_SIZE
-            default_engine_config["DefaultExecutorDpuSize"] = DEFAULT_SPARK_EXECUTOR_DPU_SIZE
-            default_engine_config["SparkProperties"] = default_spark_properties
+        user_engine_config = self.config.get("engine_config", None) or {}
+        provided_spark_properties = user_engine_config.pop("SparkProperties", None)
+        if provided_spark_properties:
+            default_spark_properties.update(provided_spark_properties)
 
-        engine_config = self.config.get("engine_config", None)
-
-        if engine_config:
-            provided_spark_properties = engine_config.get("SparkProperties", None)
-            if provided_spark_properties:
-                default_spark_properties.update(provided_spark_properties)
-                if not is_spark_35:
-                    default_engine_config["SparkProperties"] = default_spark_properties
-            if "SparkProperties" in engine_config:
-                engine_config.pop("SparkProperties")
-            default_engine_config.update(engine_config)
-
-        # Spark 3.5 rejects these keys; strip any that slipped through.
         if is_spark_35:
-            for key in (
-                "CoordinatorDpuSize",
-                "DefaultExecutorDpuSize",
-                "SparkProperties",
-            ):
-                default_engine_config.pop(key, None)
-
-        # For Spark 3.5, translate SparkProperties into Classifications format.
-        if is_spark_35 and default_spark_properties:
-            classifications = default_engine_config.get("Classifications", [])
-            merged_props = {k: str(v) for k, v in default_spark_properties.items()}
-            existing = next(
-                (c for c in classifications if c.get("Name") == "spark-defaults"), None
+            engine_config = self._build_spark_35_engine_config(
+                default_spark_properties, user_engine_config
             )
-            if existing:
-                existing.setdefault("Properties", {}).update(merged_props)
-            else:
-                classifications.append({"Name": "spark-defaults", "Properties": merged_props})
-            default_engine_config["Classifications"] = classifications
-
-        engine_config = default_engine_config
+        else:
+            engine_config = self._build_legacy_engine_config(
+                default_spark_properties, user_engine_config
+            )
 
         if not isinstance(engine_config, dict):
             raise TypeError("Engine configuration has to be of type dict")
@@ -200,4 +170,54 @@ class AthenaSparkSessionConfig:
         if engine_config["MaxConcurrentDpus"] == 1:
             raise KeyError("The lowest value supported for MaxConcurrentDpus is 2")
         LOGGER.debug(f"Setting engine configuration: {engine_config}")
+        return engine_config
+
+    @staticmethod
+    def _build_legacy_engine_config(
+        spark_properties: Dict[str, str],
+        user_engine_config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Engine configuration for Spark 3.x (Calculations API)."""
+        engine_config: Dict[str, Any] = {
+            "CoordinatorDpuSize": DEFAULT_SPARK_COORDINATOR_DPU_SIZE,
+            "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
+            "DefaultExecutorDpuSize": DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
+            "SparkProperties": spark_properties,
+        }
+        engine_config.update(user_engine_config)
+        # Defaults + user overrides are both stored in SparkProperties;
+        # ensure the merged view wins over any SparkProperties pre-merged
+        # into user_engine_config upstream.
+        engine_config["SparkProperties"] = spark_properties
+        return engine_config
+
+    @staticmethod
+    def _build_spark_35_engine_config(
+        spark_properties: Dict[str, str],
+        user_engine_config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Engine configuration for Apache Spark 3.5 (Spark Connect).
+
+        Spark 3.5 rejects ``CoordinatorDpuSize``, ``DefaultExecutorDpuSize``,
+        and ``SparkProperties`` — the latter must be supplied via
+        ``Classifications`` with name ``spark-defaults``.
+        """
+        engine_config: Dict[str, Any] = {
+            "MaxConcurrentDpus": DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
+        }
+        engine_config.update(user_engine_config)
+        for rejected in ("CoordinatorDpuSize", "DefaultExecutorDpuSize", "SparkProperties"):
+            engine_config.pop(rejected, None)
+
+        if spark_properties:
+            classifications = engine_config.get("Classifications", [])
+            merged = {k: str(v) for k, v in spark_properties.items()}
+            existing = next(
+                (c for c in classifications if c.get("Name") == "spark-defaults"), None
+            )
+            if existing:
+                existing.setdefault("Properties", {}).update(merged)
+            else:
+                classifications.append({"Name": "spark-defaults", "Properties": merged})
+            engine_config["Classifications"] = classifications
         return engine_config

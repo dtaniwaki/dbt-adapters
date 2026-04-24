@@ -1564,7 +1564,7 @@ class TestGeneratePythonSubmissionResponse:
 
     def test_returns_error_response_when_submission_result_is_empty(self, adapter):
         response = self._call(adapter, None)
-        assert response.code == "ERROR"
+        assert response._message == "ERROR"
         assert response.dpu_execution_in_millis is None
         assert response.spark_session_id is None
         assert response.spark_calculation_execution_id is None
@@ -1576,14 +1576,14 @@ class TestGeneratePythonSubmissionResponse:
             "SparkCalculationExecutionId": "calc-456",
         }
         response = self._call(adapter, submission_result)
-        assert response.code == "OK"
+        assert response._message == "OK"
         assert response.dpu_execution_in_millis == 12345
         assert response.spark_session_id == "abc-123"
         assert response.spark_calculation_execution_id == "calc-456"
 
     def test_returns_ok_response_when_statistics_missing(self, adapter):
         response = self._call(adapter, {"SparkSessionId": "abc-123"})
-        assert response.code == "OK"
+        assert response._message == "OK"
         assert response.dpu_execution_in_millis is None
         assert response.spark_session_id == "abc-123"
         assert response.spark_calculation_execution_id is None
@@ -1593,14 +1593,14 @@ class TestGeneratePythonSubmissionResponse:
             adapter,
             {"SparkConnect": True, "SparkSessionId": "spark-connect-session"},
         )
-        assert response.code == "OK"
+        assert response._message == "OK"
         assert response.dpu_execution_in_millis is None
         assert response.spark_session_id == "spark-connect-session"
         assert response.spark_calculation_execution_id is None
 
     def test_handles_non_dict_submission_result(self, adapter):
         response = self._call(adapter, "truthy")
-        assert response.code == "OK"
+        assert response._message == "OK"
         assert response.dpu_execution_in_millis is None
         assert response.spark_session_id is None
         assert response.spark_calculation_execution_id is None
