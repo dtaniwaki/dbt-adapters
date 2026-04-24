@@ -84,14 +84,9 @@ def _is_transient_spark_error(e: BaseException) -> bool:
     Prefer gRPC status code when the exception exposes one; fall back to
     substring matching against known pyspark/Athena messages.
     """
-    # gRPC errors may be wrapped by pyspark; walk the chain.  Track seen
-    # exception identities to handle the rare case of a self-referential
-    # ``__cause__`` / ``__context__`` cycle introduced by pathological user
-    # code or instrumentation wrappers.
-    seen: set = set()
+    # gRPC errors may be wrapped by pyspark; walk the chain.
     current: Optional[BaseException] = e
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
+    while current is not None:
         code_fn = getattr(current, "code", None)
         if callable(code_fn):
             try:

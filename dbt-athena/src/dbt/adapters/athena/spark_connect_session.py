@@ -26,13 +26,8 @@ SessionKey = Tuple[str, str]
 _PLACEHOLDER_PREFIX = "__creating_"
 
 
-def _is_placeholder(info: Dict[str, Any]) -> bool:
-    """Placeholder rows reserve a pool slot while ``start_session`` is in
-    flight.  They are identified by an explicit flag in the info dict so a
-    real Athena session id that happens to match ``_PLACEHOLDER_PREFIX``
-    can never be confused with a placeholder.
-    """
-    return bool(info.get("is_placeholder"))
+def _is_placeholder(session_id: str) -> bool:
+    return session_id.startswith(_PLACEHOLDER_PREFIX)
 
 
 class SparkConnectSessionPool:
@@ -45,10 +40,6 @@ class SparkConnectSessionPool:
     _EVICTION_INTERVAL = 30.0
     _MAX_SESSION_RETRIES = 5
     _SESSION_RETRY_BASE_SECONDS = 5
-    # Tolerate this many consecutive UNKNOWN readings (status API failed) before
-    # evicting a session — transient IAM / networking blips should not kill a
-    # session that is actually fine.
-    _UNKNOWN_EVICTION_THRESHOLD = 3
 
     def __new__(cls) -> "SparkConnectSessionPool":
         # Single check under the lock.  The "double-checked locking with a
@@ -99,7 +90,7 @@ class SparkConnectSessionPool:
                 stale_sids = [
                     sid
                     for sid, info in self._sessions.items()
-                    if not _is_placeholder(info) and info["key"][0] != invocation_id
+                    if not _is_placeholder(sid) and info["key"][0] != invocation_id
                 ]
                 if stale_sids:
                     LOGGER.debug(
@@ -112,7 +103,7 @@ class SparkConnectSessionPool:
 
                 # Reuse an idle session with the same key.
                 for sid, info in self._sessions.items():
-                    if _is_placeholder(info):
+                    if _is_placeholder(sid):
                         continue
                     if info["key"] == key and info["load"] == 0:
                         info["load"] = 1  # reserve optimistically for liveness check
@@ -133,7 +124,6 @@ class SparkConnectSessionPool:
                             "key": key,
                             "client": athena_client,
                             "load": 1,
-                            "is_placeholder": True,
                         }
 
             # Terminate stale sessions outside the lock (API calls are slow).
@@ -252,10 +242,6 @@ class SparkConnectSessionPool:
 
     def register(self, session_id: str, key: SessionKey, athena_client: Any) -> None:
         with self._lock:
-            if session_id in self._sessions:
-                LOGGER.debug(
-                    f"Spark Connect session {session_id} is already registered; overwriting"
-                )
             self._sessions[session_id] = {
                 "key": key,
                 "client": athena_client,
@@ -296,7 +282,7 @@ class SparkConnectSessionPool:
         """
         with self._lock:
             entries = [
-                (sid, info) for sid, info in self._sessions.items() if not _is_placeholder(info)
+                (sid, info) for sid, info in self._sessions.items() if not _is_placeholder(sid)
             ]
             self._sessions.clear()
         self._terminate_entries(entries)
@@ -312,7 +298,7 @@ class SparkConnectSessionPool:
             entries = [
                 (sid, info)
                 for sid, info in self._sessions.items()
-                if not _is_placeholder(info) and info["key"][0] == invocation_id
+                if not _is_placeholder(sid) and info["key"][0] == invocation_id
             ]
             for sid, _ in entries:
                 self._sessions.pop(sid, None)
@@ -329,9 +315,7 @@ class SparkConnectSessionPool:
     def _evict_dead_sessions(self, athena_client: Any) -> int:
         """Remove sessions that Athena has already terminated or degraded."""
         with self._lock:
-            session_ids = [
-                sid for sid, info in self._sessions.items() if not _is_placeholder(info)
-            ]
+            session_ids = [sid for sid in self._sessions if not _is_placeholder(sid)]
 
         evicted = 0
         for session_id in session_ids:
@@ -339,33 +323,17 @@ class SparkConnectSessionPool:
                 state = athena_client.get_session_status(SessionId=session_id)["Status"].get(
                     "State", ""
                 )
-            except Exception:  # noqa: BLE001 - treat as temporarily unknown
-                state = "UNKNOWN"
+            except Exception:  # noqa: BLE001 - treat as dead
+                state = ""
 
-            with self._lock:
-                info = self._sessions.get(session_id)
-                if info is None:
-                    continue
-                if state in self._DEAD_SESSION_STATES:
-                    LOGGER.debug(
-                        f"Evicting dead Spark Connect session {session_id} (state={state})"
-                    )
-                    self._sessions.pop(session_id, None)
-                    evicted += 1
-                elif state == "UNKNOWN":
-                    # Don't evict immediately: a single status API failure
-                    # may be a transient AWS-side blip.  Only give up after
-                    # several consecutive failures.
-                    info["unknown_count"] = info.get("unknown_count", 0) + 1
-                    if info["unknown_count"] >= self._UNKNOWN_EVICTION_THRESHOLD:
+            if state in self._DEAD_SESSION_STATES or not state:
+                with self._lock:
+                    if session_id in self._sessions:
                         LOGGER.debug(
-                            f"Evicting Spark Connect session {session_id} after "
-                            f"{info['unknown_count']} consecutive UNKNOWN readings"
+                            f"Evicting dead Spark Connect session {session_id} (state={state})"
                         )
                         self._sessions.pop(session_id, None)
                         evicted += 1
-                else:
-                    info["unknown_count"] = 0
         return evicted
 
     # -- test helpers -----------------------------------------------------

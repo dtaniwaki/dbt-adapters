@@ -233,7 +233,7 @@ class TestEviction:
         assert evicted == 1
         assert "sid-dead" not in pool._snapshot()
 
-    def test_unknown_state_is_not_evicted_on_first_failure(self):
+    def test_unknown_state_is_evicted(self):
         pool = SparkConnectSessionPool()
         client = MagicMock()
         pool.register("sid-x", ("inv", "fp"), client)
@@ -241,36 +241,8 @@ class TestEviction:
 
         evicted = pool._evict_dead_sessions(client)
 
-        assert evicted == 0
-        assert "sid-x" in pool._snapshot()
-
-    def test_unknown_state_is_evicted_after_threshold(self):
-        pool = SparkConnectSessionPool()
-        client = MagicMock()
-        pool.register("sid-x", ("inv", "fp"), client)
-        client.get_session_status.side_effect = Exception("boom")
-
-        # Three consecutive UNKNOWN readings trips the grace threshold.
-        for _ in range(SparkConnectSessionPool._UNKNOWN_EVICTION_THRESHOLD):
-            pool._evict_dead_sessions(client)
-
+        assert evicted == 1
         assert "sid-x" not in pool._snapshot()
-
-    def test_unknown_counter_resets_on_good_status(self):
-        pool = SparkConnectSessionPool()
-        client = MagicMock()
-        pool.register("sid-x", ("inv", "fp"), client)
-
-        client.get_session_status.side_effect = Exception("boom")
-        pool._evict_dead_sessions(client)  # count = 1
-        client.get_session_status.side_effect = None
-        client.get_session_status.return_value = {"Status": {"State": "IDLE"}}
-        pool._evict_dead_sessions(client)  # should reset counter
-
-        # After reset, one further failure must NOT evict.
-        client.get_session_status.side_effect = Exception("boom")
-        pool._evict_dead_sessions(client)
-        assert "sid-x" in pool._snapshot()
 
     def test_idle_session_is_not_evicted(self):
         pool = SparkConnectSessionPool()
@@ -399,7 +371,6 @@ class TestConcurrency:
         max_sessions while the slot is being filled."""
         pool = SparkConnectSessionPool()
         start_gate = threading.Event()
-        all_workers_queued = threading.Barrier(5 + 1)  # 5 workers + main
         counter = {"n": 0}
         counter_lock = threading.Lock()
 
@@ -420,7 +391,6 @@ class TestConcurrency:
         errors: list = []
 
         def worker():
-            all_workers_queued.wait(timeout=2.0)
             try:
                 sid = pool.acquire(
                     key=("inv", "fp"),
@@ -439,9 +409,8 @@ class TestConcurrency:
         threads = [threading.Thread(target=worker) for _ in range(5)]
         for t in threads:
             t.start()
-        # Release all workers simultaneously instead of relying on sleep-based
-        # "probably scheduled by now" heuristics.
-        all_workers_queued.wait(timeout=2.0)
+        # Give workers a moment to queue up before releasing start_session.
+        time.sleep(0.05)
         start_gate.set()
         for t in threads:
             t.join()
