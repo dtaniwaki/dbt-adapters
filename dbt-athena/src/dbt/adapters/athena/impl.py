@@ -961,6 +961,7 @@ class AthenaAdapter(SQLAdapter):
                     self._aws_account_id = account_id
         return account_id
 
+    @lru_cache(maxsize=32)
     def _get_data_catalog(self, database: str) -> Optional[DataCatalogTypeDef]:
         if database:
             conn = self.connections.get_thread_connection()
