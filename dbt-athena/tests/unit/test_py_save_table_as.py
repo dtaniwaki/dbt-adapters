@@ -36,6 +36,9 @@ def _render(
     target_identifier="my_table",
     this_identifier="my_table",
     schema="my_schema",
+    assume_role_arn=None,
+    assume_role_external_id=None,
+    assume_role_session_name=None,
 ):
     """Render athena__py_save_table_as with stubbed dbt context.
 
@@ -47,12 +50,15 @@ def _render(
     target_relation = SimpleNamespace(schema=schema, identifier=target_identifier)
     context = {
         "target": SimpleNamespace(
-            assume_role_arn=None,
-            assume_role_external_id=None,
-            assume_role_session_name=None,
+            assume_role_arn=assume_role_arn,
+            assume_role_external_id=assume_role_external_id,
+            assume_role_session_name=assume_role_session_name,
             region_name="us-east-1",
         ),
         "this": SimpleNamespace(schema=schema, identifier=this_identifier),
+        # spark_cross_account_catalog merge added a top-level config.get() in the
+        # template; tests render without dbt context so we stub config out.
+        "config": SimpleNamespace(get=lambda *_, **__: False),
     }
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(_MACRO_DIR),
@@ -269,3 +275,33 @@ class TestSkipMaterializeWhenModelReturnsNone:
         calls = self._exec_trailing_block(table_exists=True, model_returns=sentinel)
         assert len(calls) == 1
         assert calls[0][0] is sentinel
+
+
+class TestSkipMaterializeGlueSession:
+    """The glue client for the materialize-check honours assume_role_arn only
+    on the legacy (non Spark 3.5) path. On Spark 3.5 the submitter installs the
+    assumed role as the process default session, so a second explicit
+    sts.assume_role inside the model body would self-assume and fail."""
+
+    def test_spark35_uses_default_session_glue_client(self):
+        rendered = _render(
+            {"location": "s3://b/p", "spark_engine_version": "3.5"},
+            assume_role_arn="arn:aws:iam::123456789012:role/dbt",
+        )
+        assert 'glue = boto3.client("glue", region_name="us-east-1")' in rendered
+        assert ".assume_role(" not in rendered
+        assert "aws_access_key_id=_sts_creds" not in rendered
+
+    def test_legacy_path_assumes_role_for_glue_client(self):
+        rendered = _render(
+            {"location": "s3://b/p"},
+            assume_role_arn="arn:aws:iam::123456789012:role/dbt",
+        )
+        assert ".assume_role(" in rendered
+        assert 'RoleArn="arn:aws:iam::123456789012:role/dbt"' in rendered
+        assert "aws_access_key_id=_sts_creds" in rendered
+
+    def test_no_assume_role_uses_default_session_glue_client(self):
+        rendered = _render({"location": "s3://b/p"})
+        assert 'glue = boto3.client("glue", region_name="us-east-1")' in rendered
+        assert ".assume_role(" not in rendered

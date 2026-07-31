@@ -9,7 +9,6 @@ import os
 from unittest import mock
 
 import jinja2
-import pytest
 
 _TABLE_DIR = os.path.normpath(
     os.path.join(
@@ -45,7 +44,7 @@ class MockColumn:
         self.quoted = f'"{name}"'
 
 
-def _render_macro(batches, columns=None, temporary=False):
+def _render_macro(batches, columns=None, temporary=False, partitioned_by=("date_col",)):
     """Render create_table_as_with_partitions with stubbed context.
 
     Args:
@@ -53,6 +52,8 @@ def _render_macro(batches, columns=None, temporary=False):
                  Pass an empty list to simulate a zero-row source query.
         columns: List of MockColumn objects for adapter.get_columns_in_relation.
         temporary: Value for the ``temporary`` parameter.
+        partitioned_by: Value returned by config.get('partitioned_by'); pass None to
+                        simulate an unpartitioned model.
 
     Returns:
         List of SQL strings passed to run_query, in call order.
@@ -67,8 +68,10 @@ def _render_macro(batches, columns=None, temporary=False):
 
     def mock_dispatch(macro_name, package_name=None):
         """Return a simple CREATE TABLE stub, bypassing athena__create_table_as."""
+
         def simple_create(tmp, rel, sql, lang="sql", skip=False):
             return f"CREATE TABLE {rel} AS {sql}"
+
         return simple_create
 
     def mock_run_query(sql):
@@ -78,6 +81,7 @@ def _render_macro(batches, columns=None, temporary=False):
     adapter = mock.Mock()
     adapter.dispatch = mock_dispatch
     adapter.get_columns_in_relation = mock.Mock(return_value=columns)
+    adapter.check_model_timeout = mock.Mock(return_value=None)
 
     api = mock.Mock()
     api.Relation.create = mock.Mock(return_value=tmp_relation)
@@ -93,7 +97,14 @@ def _render_macro(batches, columns=None, temporary=False):
         "get_partition_batches": lambda **kwargs: batches,
         "exceptions": mock.Mock(),
     }
-    context["config"].get = lambda key, *args, **kwargs: kwargs.get("default", args[0] if args else None)
+    config_overrides = {"partitioned_by": list(partitioned_by) if partitioned_by else None}
+
+    def mock_config_get(key, *args, **kwargs):
+        if key in config_overrides:
+            return config_overrides[key]
+        return kwargs.get("default", args[0] if args else None)
+
+    context["config"].get = mock_config_get
 
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(_TABLE_DIR),
@@ -140,11 +151,11 @@ class TestSingleBatch:
     """With one partition batch, the target table is created via CTAS with a WHERE clause."""
 
     def test_run_query_called_twice(self):
-        calls = _render_macro(batches=['"date_col"=DATE\'2024-01-01\''])
+        calls = _render_macro(batches=["\"date_col\"=DATE'2024-01-01'"])
         assert len(calls) == 2
 
     def test_target_table_uses_where_clause(self):
-        batch = '"date_col"=DATE\'2024-01-01\''
+        batch = "\"date_col\"=DATE'2024-01-01'"
         calls = _render_macro(batches=[batch])
         target_sql = calls[1]
         assert "WHERE" in target_sql.upper()
@@ -157,21 +168,21 @@ class TestMultipleBatches:
     def test_run_query_call_count(self):
         """N batches → 1 staging CREATE + 1 target CREATE + (N-1) INSERTs = N+1 calls."""
         batches = [
-            '"date_col"=DATE\'2024-01-01\'',
-            '"date_col"=DATE\'2024-01-02\'',
-            '"date_col"=DATE\'2024-01-03\'',
+            "\"date_col\"=DATE'2024-01-01'",
+            "\"date_col\"=DATE'2024-01-02'",
+            "\"date_col\"=DATE'2024-01-03'",
         ]
         calls = _render_macro(batches=batches)
         assert len(calls) == len(batches) + 1
 
     def test_first_batch_creates_table(self):
-        batches = ['"date_col"=DATE\'2024-01-01\'', '"date_col"=DATE\'2024-01-02\'']
+        batches = ["\"date_col\"=DATE'2024-01-01'", "\"date_col\"=DATE'2024-01-02'"]
         calls = _render_macro(batches=batches)
         # calls[0] = staging CREATE, calls[1] = first batch CREATE TABLE
         assert "CREATE TABLE" in calls[1].upper()
 
     def test_subsequent_batches_use_insert(self):
-        batches = ['"date_col"=DATE\'2024-01-01\'', '"date_col"=DATE\'2024-01-02\'']
+        batches = ["\"date_col\"=DATE'2024-01-01'", "\"date_col\"=DATE'2024-01-02'"]
         calls = _render_macro(batches=batches)
         # calls[2] = second batch INSERT
         assert "INSERT INTO" in calls[2].upper()

@@ -64,12 +64,12 @@ from dbt.adapters.athena.constants import (
     S3_TABLES_CATALOG_TYPE,
     S3_TABLES_GLUE_CATALOG_PREFIX,
 )
-from dbt.adapters.athena.session import get_boto3_session_from_credentials
 from dbt.adapters.athena.exceptions import (
     AthenaModelTimeoutError,
     S3LocationException,
     SnapshotMigrationRequired,
 )
+from dbt.adapters.athena.session import get_boto3_session_from_credentials
 from dbt.adapters.athena.lakeformation import (
     LfGrantsConfig,
     LfPermissions,
@@ -217,9 +217,7 @@ class AthenaAdapter(SQLAdapter):
         deadline = getattr(self._model_deadline, "value", None)
         if deadline is not None and time.monotonic() >= deadline:
             self._model_deadline.value = None
-            raise AthenaModelTimeoutError(
-                "Model execution exceeded model_timeout_seconds"
-            )
+            raise AthenaModelTimeoutError("Model execution exceeded model_timeout_seconds")
 
     # There is no such concept as constraints in Athena
     CONSTRAINT_SUPPORT = {

@@ -28,10 +28,15 @@ _MACRO_DIR = os.path.normpath(
 
 
 def _build_spark_dbt_obj(source_stub, ref_stub, spark_stub):
+    from types import SimpleNamespace
+
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(_MACRO_DIR),
         extensions=["jinja2.ext.do"],
     )
+    # spark_cross_account_catalog merge added a top-level config.get() in the
+    # template; tests render without dbt context so we stub config out.
+    env.globals["config"] = SimpleNamespace(get=lambda *_, **__: False)
     template = env.get_template("python_submissions.sql")
     rendered = template.module.athena__py_get_spark_dbt_object()
 
