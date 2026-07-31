@@ -77,7 +77,7 @@ class MockAdapter:
     def get_columns_in_relation(self, relation):
         return self._columns
 
-    def run_query_with_partitions_limit_catching(self, sql):
+    def run_query_with_partitions_limit_catching(self, sql, disable_batch_fallback=False):
         self.last_sql = str(sql).strip()
         return self._query_result
 
