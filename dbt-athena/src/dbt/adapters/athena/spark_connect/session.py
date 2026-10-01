@@ -5,13 +5,16 @@ from __future__ import annotations
 import random
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, TypedDict
 
 from dbt_common.exceptions import DbtRuntimeError
 from mypy_boto3_athena.client import AthenaClient
 from mypy_boto3_athena.type_defs import EngineConfigurationTypeDef
 
 from dbt.adapters.athena.constants import LOGGER, SESSION_IDLE_TIMEOUT_MIN
+
+if TYPE_CHECKING:
+    from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
 
 SessionKey = Tuple[str, str]
 
@@ -24,7 +27,7 @@ class _SessionInfo(TypedDict, total=False):
     draining: bool
     # Spark Connect client bound to this Athena session, shared by every
     # model that attaches to it. ``None`` until the first model creates it.
-    spark: Optional[Any]
+    spark: Optional[ConnectSparkSession]
 
 
 class _GlobalSessionLimitReached(Exception):
@@ -303,7 +306,7 @@ class SparkConnectSessionPool:
         }
         return session_id
 
-    def get_spark(self, session_id: str) -> Optional[Any]:
+    def get_spark(self, session_id: str) -> Optional[ConnectSparkSession]:
         """Return the Spark Connect client bound to ``session_id``, if any."""
         with self._lock:
             info = self._sessions.get(session_id)
@@ -311,7 +314,7 @@ class SparkConnectSessionPool:
                 return None
             return info.get("spark")
 
-    def set_spark(self, session_id: str, spark: Any) -> Any:
+    def set_spark(self, session_id: str, spark: ConnectSparkSession) -> ConnectSparkSession:
         """Bind ``spark`` to ``session_id`` unless another client already is.
 
         Returns the client that is bound after the call. When another caller

@@ -11,7 +11,7 @@ import traceback
 import uuid
 from functools import cached_property
 from hashlib import md5
-from typing import Any, Dict, NamedTuple, Optional, Tuple, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple, TypedDict
 
 import boto3
 import botocore
@@ -48,6 +48,9 @@ from dbt.adapters.athena.spark_connect.errors import (
     is_transient_spark_error,
 )
 from dbt.adapters.athena.spark_connect.session import SparkConnectSessionPool
+
+if TYPE_CHECKING:
+    from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
 
 
 class SparkConnectResult(TypedDict):
@@ -337,7 +340,7 @@ class SparkConnectSubmitter:
             f"{deadline_seconds}s (endpoint-wait deadline, not execution timeout)"
         )
 
-    def _get_or_create_spark(self, session_id: str) -> Any:
+    def _get_or_create_spark(self, session_id: str) -> ConnectSparkSession:
         """Return the Spark Connect client shared by all models on ``session_id``.
 
         The client is created once per Athena session and kept in the pool
