@@ -33,6 +33,7 @@
     {% set partitions_batches = get_partition_batches(tmp_relation) %}
     {% do log('BATCHES TO PROCESS: ' ~ partitions_batches | length) %}
     {%- for batch in partitions_batches -%}
+        {%- do adapter.check_model_timeout() -%}
         {%- do log('BATCH PROCESSING: ' ~ loop.index ~ ' OF ' ~ partitions_batches|length) -%}
         {%- set insert_batch_partitions -%}
             insert into {{ target_relation }} ({{ dest_cols_csv }})
