@@ -164,9 +164,7 @@ class AthenaAdapter(SQLAdapter):
         deadline = getattr(self._model_deadline, "value", None)
         if deadline is not None and time.monotonic() >= deadline:
             self._model_deadline.value = None
-            raise AthenaModelTimeoutError(
-                "Model execution exceeded model_timeout_seconds"
-            )
+            raise AthenaModelTimeoutError("Model execution exceeded model_timeout_seconds")
 
     # There is no such concept as constraints in Athena
     CONSTRAINT_SUPPORT = {
