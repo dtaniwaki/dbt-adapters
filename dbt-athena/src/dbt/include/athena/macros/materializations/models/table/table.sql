@@ -47,6 +47,8 @@
 
   {{ run_hooks(pre_hooks) }}
 
+  {%- do adapter.set_model_timeout(config.get('model_timeout_seconds')) -%}
+
   {%- if table_type == 'hive' -%}
 
     -- for ha tables that are not in full refresh mode and when the relation exists we use the swap behavior
@@ -177,6 +179,8 @@
   {% endif %}
 
   {% do persist_docs(target_relation, model) %}
+
+  {%- do adapter.clear_model_timeout() -%}
 
   {{ return({'relations': [target_relation]}) }}
 
