@@ -77,6 +77,7 @@
     update_condition,
     insert_condition,
     force_batch,
+    disable_batch_fallback=False,
     statement_name="main"
   )
 %}
@@ -151,7 +152,7 @@
           {{ merge_part }}
       {%- endset -%}
 
-      {%- set query_result =  adapter.run_query_with_partitions_limit_catching(merge_full) -%}
+      {%- set query_result =  adapter.run_query_with_partitions_limit_catching(merge_full, disable_batch_fallback) -%}
       {%- do log('QUERY RESULT: ' ~ query_result) -%}
       {%- if query_result == 'TOO_MANY_OPEN_PARTITIONS' -%}
         {% do batch_iceberg_merge(tmp_relation, target_relation, merge_part, dest_cols_csv) %}
