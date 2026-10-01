@@ -150,6 +150,12 @@ class AthenaConfig(AdapterConfig):
             falling back to batch mode.
         unique_tmp_table_suffix: Enforce the use of a unique id as tmp table suffix instead of __dbt_tmp.
         temp_schema: Define in which schema to create temporary tables used in incremental runs.
+        build_strategy: How to build the model. One of:
+            - 'tmp_table' (default): stage data into a __dbt_tmp CTAS table, then INSERT/MERGE from it.
+            - 'subquery': skip the staging CTAS and apply the compiled SQL directly via subquery.
+              Creates an empty tmp table (WITH NO DATA) for schema comparison only.
+              Supported for table materialization and incremental (merge / append / insert_overwrite).
+              Incompatible with force_batch and Python models.
     """
 
     work_group: Optional[str] = None
@@ -175,6 +181,7 @@ class AthenaConfig(AdapterConfig):
     unique_tmp_table_suffix: bool = False
     temp_schema: Optional[str] = None
     model_timeout_seconds: Optional[int] = None
+    build_strategy: str = "tmp_table"
 
 
 class AthenaAdapter(SQLAdapter):
