@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from typing import Any, List, Optional
@@ -32,6 +33,7 @@ def apply_pyspark_workarounds() -> None:
         _refresh_reattach_iterator_metadata()
         _track_retry_blocks()
         _retry_permission_denied_in_spark_client()
+        _skip_artifacts_already_added()
         _patches_applied = True
 
 
@@ -244,3 +246,52 @@ def _retry_permission_denied_in_spark_client() -> None:
         return False
 
     SparkConnectClient.retry_exception = classmethod(_patched)
+
+
+def _skip_artifacts_already_added() -> None:
+    """Skip re-adding an artifact the client already added with the same content.
+
+    Every model on a shared client adds its artifacts again, and Athena's Spark
+    Connect server rejects an artifact name that already exists in the session
+    with an empty UNKNOWN status, even when the content is identical.
+    """
+    from pyspark.sql.connect.client.artifact import ArtifactManager
+
+    ArtifactManager.add_artifacts = _add_artifacts_once
+
+
+def _artifact_digest(artifact: Any) -> str:
+    storage = artifact.storage
+    blob = getattr(storage, "blob", None)
+    if blob is not None:
+        return hashlib.sha256(blob).hexdigest()
+    # ``LocalFile.stream`` is a cached open handle that the upload reads later,
+    # so hash a separate handle instead of consuming it.
+    digest = hashlib.sha256()
+    with open(storage.path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _add_artifacts_once(self: Any, *path: str, pyfile: bool, archive: bool, file: bool) -> None:
+    artifacts = [
+        artifact
+        for p in path
+        for artifact in self._parse_artifacts(p, pyfile=pyfile, archive=archive, file=file)
+    ]
+    lock = self.__dict__.setdefault("_dbt_athena_added_artifacts_lock", threading.Lock())
+    with lock:
+        added = self.__dict__.setdefault("_dbt_athena_added_artifacts", {})
+        pending = []
+        for artifact in artifacts:
+            digest = _artifact_digest(artifact)
+            if added.get(artifact.path) == digest:
+                LOGGER.debug(f"Artifact {artifact.path} already added to this session; skipping.")
+                continue
+            pending.append((artifact, digest))
+        if not pending:
+            return
+        self._request_add_artifacts(self._add_artifacts(artifact for artifact, _ in pending))
+        for artifact, digest in pending:
+            added[artifact.path] = digest
