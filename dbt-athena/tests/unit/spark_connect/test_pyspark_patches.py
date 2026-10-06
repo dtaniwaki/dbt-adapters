@@ -483,8 +483,11 @@ class _FakeArtifactServer:
     def __init__(self):
         self.uploaded = []
         self.fail_next = False
+        self.hold_uploads = None
 
     def retrieve(self, requests):
+        if self.hold_uploads is not None:
+            self.hold_uploads.wait(timeout=5)
         names = []
         for request in requests:
             if request.HasField("batch"):
@@ -504,18 +507,20 @@ def artifact_server():
     artifact = pytest.importorskip("pyspark.sql.connect.client.artifact")
     from dbt.adapters.athena.spark_connect.pyspark_patches import _add_artifacts_once
 
+    channel = grpc.insecure_channel("localhost:1")
     manager = artifact.ArtifactManager(
         user_id=None,
         session_id="sid-1",
-        channel=grpc.insecure_channel("localhost:1"),
+        channel=channel,
         metadata=[],
     )
     server = _FakeArtifactServer()
-    manager._retrieve_responses = server.retrieve
+    manager._retrieve_responses = lambda requests: server.retrieve(requests)
     server.add = lambda path: _add_artifacts_once(
         manager, path, pyfile=True, archive=False, file=False
     )
-    return server
+    yield server
+    channel.close()
 
 
 def _write_file(path, content):
@@ -552,6 +557,23 @@ def test_failed_upload_is_retried_on_next_add(artifact_server, tmp_path):
         artifact_server.add(path)
 
     artifact_server.add(path)
+
+    assert artifact_server.uploaded == ["pyfiles/utils.zip"]
+
+
+def test_concurrent_adds_of_same_artifact_upload_once(artifact_server, tmp_path):
+    import threading
+
+    first = _write_file(tmp_path / "a" / "utils.zip", b"v1")
+    second = _write_file(tmp_path / "b" / "utils.zip", b"v1")
+    artifact_server.hold_uploads = threading.Event()
+    threads = [threading.Thread(target=artifact_server.add, args=(p,)) for p in (first, second)]
+    for thread in threads:
+        thread.start()
+    threads[0].join(timeout=0.5)
+    artifact_server.hold_uploads.set()
+    for thread in threads:
+        thread.join(timeout=5)
 
     assert artifact_server.uploaded == ["pyfiles/utils.zip"]
 
