@@ -482,22 +482,27 @@ def test_other_rpc_error_before_first_response_propagates(fake_pyspark_modules):
 class _FakeArtifactServer:
     def __init__(self):
         self.uploaded = []
+        self.payloads = []
         self.fail_next = False
         self.hold_uploads = None
 
     def retrieve(self, requests):
         if self.hold_uploads is not None:
             self.hold_uploads.wait(timeout=5)
-        names = []
+        received = []
         for request in requests:
             if request.HasField("batch"):
-                names.extend(a.name for a in request.batch.artifacts)
+                received.extend((a.name, a.data.data) for a in request.batch.artifacts)
             elif request.HasField("begin_chunk"):
-                names.append(request.begin_chunk.name)
+                received.append((request.begin_chunk.name, request.begin_chunk.initial_chunk.data))
+            elif request.HasField("chunk"):
+                name, data = received[-1]
+                received[-1] = (name, data + request.chunk.data)
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("upload failed")
-        self.uploaded.extend(names)
+        self.uploaded.extend(name for name, _ in received)
+        self.payloads.extend(data for _, data in received)
         return MagicMock(artifacts=[])
 
 
@@ -541,6 +546,15 @@ def test_artifact_with_changed_content_is_sent_again(artifact_server, tmp_path):
     artifact_server.add(_write_file(tmp_path / "b" / "utils.zip", b"v2"))
 
     assert artifact_server.uploaded == ["pyfiles/utils.zip", "pyfiles/utils.zip"]
+    assert artifact_server.payloads == [b"v1", b"v2"]
+
+
+def test_uploaded_payload_is_the_full_file_content(artifact_server, tmp_path):
+    large = bytes(range(256)) * 1024
+    artifact_server.add(_write_file(tmp_path / "small.zip", b"v1"))
+    artifact_server.add(_write_file(tmp_path / "large.zip", large))
+
+    assert artifact_server.payloads == [b"v1", large]
 
 
 def test_artifacts_with_different_names_are_each_added(artifact_server, tmp_path):

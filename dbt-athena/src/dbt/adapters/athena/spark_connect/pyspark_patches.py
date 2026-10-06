@@ -261,14 +261,10 @@ def _skip_artifacts_already_added() -> None:
 
 
 def _artifact_digest(artifact: Any) -> str:
-    storage = artifact.storage
-    blob = getattr(storage, "blob", None)
-    if blob is not None:
-        return hashlib.sha256(blob).hexdigest()
     # ``LocalFile.stream`` is a cached open handle that the upload reads later,
     # so hash a separate handle instead of consuming it.
     digest = hashlib.sha256()
-    with open(storage.path, "rb") as stream:
+    with open(artifact.storage.path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -286,9 +282,15 @@ def _add_artifacts_once(self: Any, *path: str, pyfile: bool, archive: bool, file
         pending = []
         for artifact in artifacts:
             digest = _artifact_digest(artifact)
-            if added.get(artifact.path) == digest:
+            previous = added.get(artifact.path)
+            if previous == digest:
                 LOGGER.debug(f"Artifact {artifact.path} already added to this session; skipping.")
                 continue
+            if previous is not None:
+                LOGGER.warning(
+                    f"Artifact {artifact.path} was already added to this session with "
+                    "different content; the server may reject the new upload."
+                )
             pending.append((artifact, digest))
         if not pending:
             return
