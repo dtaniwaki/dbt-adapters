@@ -249,20 +249,14 @@ def _retry_permission_denied_in_spark_client() -> None:
 
 
 def _skip_artifacts_already_added() -> None:
-    """Skip re-adding an artifact the client already added with the same content.
-
-    Every model on a shared client adds its artifacts again, and Athena's Spark
-    Connect server rejects an artifact name that already exists in the session
-    with an empty UNKNOWN status, even when the content is identical.
-    """
+    """Athena's Spark Connect server rejects an existing artifact name even with identical content."""
     from pyspark.sql.connect.client.artifact import ArtifactManager
 
     ArtifactManager.add_artifacts = _add_artifacts_once
 
 
 def _artifact_digest(artifact: Any) -> str:
-    # ``LocalFile.stream`` is a cached open handle that the upload reads later,
-    # so hash a separate handle instead of consuming it.
+    # ``LocalFile.stream`` is a cached handle the upload reads later.
     digest = hashlib.sha256()
     with open(artifact.storage.path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
