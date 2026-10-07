@@ -13,7 +13,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
-    NamedTuple,
     Optional,
     Tuple,
     TypedDict,
@@ -94,14 +93,91 @@ def _spark_max_executors(engine_config: EngineConfigurationTypeDef) -> Optional[
     return None
 
 
-class _AttemptResult(NamedTuple):
-    result: Optional[SparkConnectResult]
-    error: Optional[BaseException]
-    done: bool
-    session_id: Optional[str] = None
-    session_ended: bool = False
-    retryable: bool = True
-    category: Optional[str] = None
+class _TransientAttemptFailure(Exception):
+    def __init__(
+        self,
+        error: BaseException,
+        session_id: str,
+        session_ended: bool,
+        retryable: bool,
+        category: str,
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.session_id = session_id
+        self.session_ended = session_ended
+        self.retryable = retryable
+        self.category = category
+
+
+class _ExecutionGuard:
+    """Tags the model's operations, keeps the session alive and enforces the execution timeout."""
+
+    def __init__(
+        self,
+        spark: ConnectSparkSession,
+        session_id: str,
+        relation_name: Optional[str],
+        timeout: float,
+        budget: float,
+        keepalive_interval: float,
+        timeout_event: threading.Event,
+    ) -> None:
+        self._spark = spark
+        self._session_id = session_id
+        self._relation_name = relation_name
+        self._timeout = timeout
+        self._budget = budget
+        self._keepalive_interval = keepalive_interval
+        self._timeout_event = timeout_event
+        # Tags are thread-local in the Spark Connect client, so the watchdog
+        # can cancel only this model's operations on the shared client.
+        self._tag = f"dbt-model-{uuid.uuid4().hex}"
+        self._tagged = False
+        self._keepalive: Optional[SessionKeepalive] = None
+        self._timer: Optional[threading.Timer] = None
+
+    def __enter__(self) -> "_ExecutionGuard":
+        try:
+            self._spark.addTag(self._tag)
+            self._tagged = True
+            if self._keepalive_interval > 0:
+                self._keepalive = SessionKeepalive(
+                    self._spark, self._session_id, self._keepalive_interval
+                )
+                self._keepalive.start()
+            self._timer = threading.Timer(self._budget, self._on_timeout)
+            self._timer.start()
+        except BaseException:
+            self._release()
+            raise
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._release()
+
+    def _on_timeout(self) -> None:
+        self._timeout_event.set()
+        LOGGER.warning(
+            f"Model {self._relation_name} (session {self._session_id}) - "
+            f"Execution timed out after {self._timeout}s"
+        )
+        self._spark.interruptTag(self._tag)
+
+    def _release(self) -> None:
+        if self._keepalive is not None:
+            self._keepalive.stop()
+        # Cancel the watchdog timer first and wait for any already-fired
+        # callback to finish, so interruptTag() cannot race with the
+        # tag removal below.
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer.join(timeout=5)
+        if self._tagged:
+            try:
+                self._spark.removeTag(self._tag)
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                LOGGER.debug(f"Ignoring error while removing Spark tag: {e}")
 
 
 class SparkConnectSubmitter:
@@ -184,65 +260,55 @@ class SparkConnectSubmitter:
         self._install_assumed_default_session()
 
         pool_start = time.monotonic()
-        last_error: Optional[BaseException] = None
-        last_session_id: Optional[str] = None
-        last_session_ended = False
-        last_outcome: Optional[_AttemptResult] = None
-        attempts_made = 0
         total_attempts = self.credentials.effective_spark_connect_max_retries + 1
+        attempt = 0
 
-        for attempt in range(1, total_attempts + 1):
-            outcome = self._attempt(compiled_code, attempt, pool_start)
-            if outcome.done:
-                assert outcome.result is not None
-                return outcome.result
-            assert outcome.error is not None
-            last_error = outcome.error
-            last_session_id = outcome.session_id
-            last_session_ended = outcome.session_ended
-            last_outcome = outcome
-            attempts_made = attempt
+        while True:
+            attempt += 1
+            try:
+                return self._attempt(compiled_code, attempt, pool_start)
+            except _TransientAttemptFailure as failure:
+                if attempt >= total_attempts or not failure.retryable:
+                    raise self._final_error(failure, attempt) from failure.error
 
-            is_last_attempt = attempt >= total_attempts
-            if is_last_attempt or not outcome.retryable:
-                break
-
-            backoff = min(2**attempt, 30) + random.uniform(0, 1)
-            if backoff >= self.timeout:
+                backoff = min(2**attempt, 30) + random.uniform(0, 1)
+                if backoff >= self.timeout:
+                    LOGGER.warning(
+                        f"Model {self.relation_name} (session {failure.session_id}) - "
+                        f"Transient Spark Connect error on "
+                        f"attempt {attempt}/{total_attempts}, "
+                        f"but backoff ({backoff:.1f}s) is at least the per-attempt "
+                        f"execution budget ({self.timeout:.1f}s); giving up."
+                    )
+                    raise self._final_error(failure, attempt) from failure.error
                 LOGGER.warning(
-                    f"Model {self.relation_name} (session {last_session_id}) - "
-                    f"Transient Spark Connect error on "
-                    f"attempt {attempt}/{total_attempts}, "
-                    f"but backoff ({backoff:.1f}s) is at least the per-attempt "
-                    f"execution budget ({self.timeout:.1f}s); giving up."
+                    f"Model {self.relation_name} (session {failure.session_id}) - "
+                    f"Transient Spark Connect error "
+                    f"(attempt {attempt}/{total_attempts}), "
+                    f"retrying in {backoff:.1f}s with new session: "
+                    f"{type(failure.error).__name__}: {failure.error}"
                 )
-                break
-            LOGGER.warning(
-                f"Model {self.relation_name} (session {last_session_id}) - "
-                f"Transient Spark Connect error "
-                f"(attempt {attempt}/{total_attempts}), "
-                f"retrying in {backoff:.1f}s with new session: "
-                f"{type(last_error).__name__}: {last_error}"
-            )
-            time.sleep(backoff)
+                time.sleep(backoff)
 
-        if last_session_ended:
-            raise SparkSessionTerminatedError(
-                f"Athena terminated Spark session {last_session_id}; "
+    def _final_error(self, failure: _TransientAttemptFailure, attempts_made: int) -> Exception:
+        error = failure.error
+        if failure.session_ended:
+            return SparkSessionTerminatedError(
+                f"Athena terminated Spark session {failure.session_id}; "
                 f"check session state and workgroup DPU/quota. "
-                f"Underlying error: {type(last_error).__name__}: {last_error}"
-            ) from last_error
-        if last_outcome is not None and not last_outcome.retryable:
-            raise DbtRuntimeError(
-                f"Spark Connect execution failed (session {last_session_id}); not retried "
-                f"because transient category '{last_outcome.category}' is not in "
-                f"spark_connect_retry_on: {type(last_error).__name__}: {last_error}"
-            ) from last_error
-        raise DbtRuntimeError(
+                f"Underlying error: {type(error).__name__}: {error}"
+            )
+        if not failure.retryable:
+            return DbtRuntimeError(
+                f"Spark Connect execution failed (session {failure.session_id}); not retried "
+                f"because transient category '{failure.category}' is not in "
+                f"spark_connect_retry_on: {type(error).__name__}: {error}"
+            )
+        return DbtRuntimeError(
             f"Spark Connect execution failed after {attempts_made} "
-            f"attempts (last session {last_session_id}): "
-            f"{type(last_error).__name__}: {last_error}"
-        ) from last_error
+            f"attempts (last session {failure.session_id}): "
+            f"{type(error).__name__}: {error}"
+        )
 
     def _install_assumed_default_session(self) -> None:
         # Spark Connect runs the model body client-side via exec(), so a bare
@@ -381,128 +447,87 @@ class SparkConnectSubmitter:
         compiled_code: str,
         attempt: int,
         pool_start: float,
-    ) -> _AttemptResult:
-        """Run one attempt; ``done=True`` on success, ``done=False`` on transient failure."""
-        pool_remaining = self.credentials.effective_spark_connect_pool_acquire_timeout - (
-            time.monotonic() - pool_start
-        )
+    ) -> SparkConnectResult:
+        pool_timeout = self.credentials.effective_spark_connect_pool_acquire_timeout
+        pool_remaining = pool_timeout - (time.monotonic() - pool_start)
         if pool_remaining <= 0:
             raise DbtRuntimeError(
-                f"Spark Connect session pool acquire timed out after "
-                f"{self.credentials.effective_spark_connect_pool_acquire_timeout} seconds."
+                f"Spark Connect session pool acquire timed out after {pool_timeout} seconds."
             )
         session_id = self._acquire_session(pool_remaining)
 
         attempt_start = time.monotonic()
-        spark = None
-        timer: Optional[threading.Timer] = None
         timeout_event = threading.Event()
         terminate_session = False
-        # Tags are thread-local in the Spark Connect client, so the watchdog
-        # can cancel only this model's operations on the shared client.
-        model_tag = f"dbt-model-{uuid.uuid4().hex}"
-        tagged = False
-        keepalive: Optional[SessionKeepalive] = None
-
-        def _elapsed() -> float:
-            return time.monotonic() - attempt_start
 
         try:
-            spark = self._get_or_create_spark(session_id)
+            try:
+                spark = self._get_or_create_spark(session_id)
 
-            exec_remaining = self.timeout - _elapsed()
-            if exec_remaining <= 0:
-                raise DbtRuntimeError(
-                    f"Spark Connect execution timed out after {self.timeout} seconds."
-                )
-
-            def _on_timeout() -> None:
-                timeout_event.set()
-                LOGGER.warning(
-                    f"Model {self.relation_name} (session {session_id}) - "
-                    f"Execution timed out after {self.timeout}s"
-                )
-                if spark is not None:
-                    spark.interruptTag(model_tag)
-
-            spark.addTag(model_tag)
-            tagged = True
-            if self.credentials.effective_spark_connect_keepalive_interval > 0:
-                keepalive = SessionKeepalive(
-                    spark, session_id, self.credentials.effective_spark_connect_keepalive_interval
-                )
-                keepalive.start()
-            timer = threading.Timer(exec_remaining, _on_timeout)
-            timer.start()
-
-            exec_globals: Dict[str, Any] = {"spark": spark}
-            exec(compiled_code, exec_globals)  # noqa: S102 - user model code
-            return _AttemptResult(
-                result=SparkConnectResult(SparkConnect=True, SparkSessionId=session_id),
-                error=None,
-                done=True,
-            )
-        except DbtRuntimeError:
-            raise
-        except Exception as e:
-            if timeout_event.is_set():
-                raise DbtRuntimeError(
-                    f"Spark Connect execution timed out after {self.timeout} seconds."
-                ) from e
-
-            category = classify_transient_spark_error(e)
-            total_attempts = self.credentials.effective_spark_connect_max_retries + 1
-            is_last_attempt = attempt >= total_attempts
-
-            session_ended = (
-                is_grpc_permission_denied(e) or is_session_ended_error(e)
-            ) and not self._pool.is_session_alive(session_id)
-            if session_ended:
-                category = SESSION_ENDED
-            terminate_session = category is not None
-            retryable = category in self.credentials.effective_spark_connect_retry_on
-
-            if not retryable or is_last_attempt:
-                LOGGER.error(
-                    f"Model {self.relation_name} (session {session_id}) - "
-                    f"Spark Connect execution failed "
-                    f"(attempt {attempt}/{total_attempts}, "
-                    f"transient category: {category}"
-                    f"{'' if retryable or category is None else ', excluded by spark_connect_retry_on'}): "
-                    f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-                )
-                if category is None:
+                budget = self.timeout - (time.monotonic() - attempt_start)
+                if budget <= 0:
                     raise DbtRuntimeError(
-                        f"Spark Connect execution failed (session {session_id}): "
-                        f"{type(e).__name__}: {e}"
-                    ) from e
+                        f"Spark Connect execution timed out after {self.timeout} seconds."
+                    )
 
-            return _AttemptResult(
-                result=None,
-                error=e,
-                done=False,
-                session_id=session_id,
-                session_ended=session_ended,
-                retryable=retryable,
-                category=category,
-            )
+                guard = _ExecutionGuard(
+                    spark,
+                    session_id,
+                    self.relation_name,
+                    self.timeout,
+                    budget,
+                    self.credentials.effective_spark_connect_keepalive_interval,
+                    timeout_event,
+                )
+                with guard:
+                    exec_globals: Dict[str, Any] = {"spark": spark}
+                    exec(compiled_code, exec_globals)  # noqa: S102 - user model code
+                return SparkConnectResult(SparkConnect=True, SparkSessionId=session_id)
+            except DbtRuntimeError:
+                raise
+            except Exception as e:
+                if timeout_event.is_set():
+                    raise DbtRuntimeError(
+                        f"Spark Connect execution timed out after {self.timeout} seconds."
+                    ) from e
+                failure = self._classify_failure(e, session_id, attempt)
+                terminate_session = True
+                raise failure from e
         finally:
-            if keepalive is not None:
-                keepalive.stop()
-            # Cancel the watchdog timer first and wait for any already-fired
-            # callback to finish, so interruptTag() cannot race with the
-            # tag removal below.
-            if timer is not None:
-                timer.cancel()
-                timer.join(timeout=5)
-            if spark is not None and tagged:
-                try:
-                    spark.removeTag(model_tag)
-                except Exception as e:  # noqa: BLE001 - best-effort cleanup
-                    LOGGER.debug(f"Ignoring error while removing Spark tag: {e}")
             # The client stays bound to the Athena session; the pool stops it
             # when the session is terminated or evicted.
             if terminate_session:
                 self._pool.terminate(session_id)
             else:
                 self._pool.release(session_id)
+
+    def _classify_failure(
+        self, e: Exception, session_id: str, attempt: int
+    ) -> _TransientAttemptFailure:
+        category = classify_transient_spark_error(e)
+        total_attempts = self.credentials.effective_spark_connect_max_retries + 1
+        is_last_attempt = attempt >= total_attempts
+
+        session_ended = (
+            is_grpc_permission_denied(e) or is_session_ended_error(e)
+        ) and not self._pool.is_session_alive(session_id)
+        if session_ended:
+            category = SESSION_ENDED
+        retryable = category in self.credentials.effective_spark_connect_retry_on
+
+        if not retryable or is_last_attempt:
+            LOGGER.error(
+                f"Model {self.relation_name} (session {session_id}) - "
+                f"Spark Connect execution failed "
+                f"(attempt {attempt}/{total_attempts}, "
+                f"transient category: {category}"
+                f"{'' if retryable or category is None else ', excluded by spark_connect_retry_on'}): "
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            )
+
+        if category is None:
+            raise DbtRuntimeError(
+                f"Spark Connect execution failed (session {session_id}): "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        return _TransientAttemptFailure(e, session_id, session_ended, retryable, category)
