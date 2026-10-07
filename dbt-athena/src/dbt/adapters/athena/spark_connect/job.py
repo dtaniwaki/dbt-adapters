@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import random
 import threading
 import time
@@ -259,8 +258,6 @@ class SparkConnectSubmitter:
 
     def _acquire_session(self, pool_timeout: float) -> str:
         """Acquire a Spark Connect session from the pool."""
-        os.environ.setdefault("SPARK_CONNECT_MODE_ENABLED", "1")
-
         spark_work_group = self.credentials.spark_work_group
         if not spark_work_group:
             raise DbtRuntimeError(

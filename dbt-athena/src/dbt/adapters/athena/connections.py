@@ -65,6 +65,7 @@ from dbt.adapters.athena.exceptions import (
 )
 from dbt.adapters.athena.query_headers import AthenaMacroQueryStringSetter
 from dbt.adapters.athena.session import get_boto3_session
+from dbt.adapters.athena.spark_connect.session import SparkConnectSessionPool
 from dbt.adapters.athena.connections_legacy import (
     AthenaConnectionManager as PyAthenaConnectionManager,
 )
@@ -899,10 +900,6 @@ class AthenaConnectionManager(SQLConnectionManager):
     def cleanup_all(self) -> None:
         # Release DPUs immediately instead of waiting for the 10-min idle timeout.
         from dbt_common.invocation import get_invocation_id
-
-        from dbt.adapters.athena.spark_connect.session import (
-            SparkConnectSessionPool,
-        )
 
         # Scope to this invocation; the singleton is shared across invocations
         # in dbt Cloud workers and test harnesses.

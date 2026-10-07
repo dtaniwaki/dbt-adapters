@@ -1,5 +1,6 @@
 """Tests for the Spark Connect submission path (Apache Spark 3.5+)."""
 
+import os
 import sys
 import time
 from unittest.mock import MagicMock, Mock, patch
@@ -1035,6 +1036,17 @@ class TestDpuRequestComputation:
         return AthenaCredentials(
             database="db", schema="schema", region_name="us-east-1", spark_work_group="wg"
         )
+
+    def test_acquire_session_leaves_connect_mode_env_alone(self, mock_credentials, monkeypatch):
+        monkeypatch.delenv("SPARK_CONNECT_MODE_ENABLED", raising=False)
+        submitter = self._make_submitter_with_engine_config(
+            {"MaxConcurrentDpus": 4}, mock_credentials
+        )
+        submitter._pool = Mock()
+
+        submitter._acquire_session(1.0)
+
+        assert "SPARK_CONNECT_MODE_ENABLED" not in os.environ
 
     def test_credentials_values_reach_pool_acquire(self, mock_credentials):
         mock_credentials.spark_connect_max_sessions = 5
