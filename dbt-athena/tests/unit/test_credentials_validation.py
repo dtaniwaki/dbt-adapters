@@ -69,3 +69,18 @@ class TestSparkConnectIntegerValidation:
         c = _make()
         assert c.spark_connect_max_retries is None
         assert c.spark_connect_dpu_budget is None
+
+
+class TestSparkConnectKeepaliveIntervalValidation:
+    def test_zero_disables(self):
+        assert _make(spark_connect_keepalive_interval=0).spark_connect_keepalive_interval == 0
+
+    def test_positive_is_accepted(self):
+        assert _make(spark_connect_keepalive_interval=120).spark_connect_keepalive_interval == 120
+
+    def test_negative_is_rejected(self):
+        with pytest.raises(
+            DbtRuntimeError,
+            match="spark_connect_keepalive_interval must be a non-negative integer",
+        ):
+            _make(spark_connect_keepalive_interval=-1)

@@ -117,6 +117,7 @@ class AthenaCredentials(Credentials):
     spark_connect_dpu_budget: Optional[int] = None
     spark_connect_pool_acquire_timeout: Optional[int] = None
     spark_connect_max_retries: Optional[int] = None
+    spark_connect_keepalive_interval: Optional[int] = None
     s3_tmp_table_dir: Optional[str] = None
     # Unfortunately we can not just use dict, must be Dict because we'll get the following error:
     # Credentials in profile "athena", target "athena" invalid: Unable to create schema for 'dict'
@@ -135,6 +136,7 @@ class AthenaCredentials(Credentials):
             ("spark_connect_dpu_budget", 1),
             ("spark_connect_pool_acquire_timeout", 1),
             ("spark_connect_max_retries", 0),
+            ("spark_connect_keepalive_interval", 0),
         ):
             raw = getattr(self, field_name)
             if raw is None:
@@ -195,6 +197,7 @@ class AthenaCredentials(Credentials):
             "seed_s3_upload_args",
             "skip_workgroup_check",
             "spark_connect_dpu_budget",
+            "spark_connect_keepalive_interval",
             "spark_connect_max_retries",
             "spark_connect_max_sessions",
             "spark_connect_pool_acquire_timeout",
