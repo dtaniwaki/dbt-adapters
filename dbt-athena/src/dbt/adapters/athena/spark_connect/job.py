@@ -138,6 +138,7 @@ class _ExecutionGuard:
         self._tagged = False
         self._keepalive: Optional[SessionKeepalive] = None
         self._timer: Optional[threading.Timer] = None
+        self._timer_started = False
 
     def __enter__(self) -> "_ExecutionGuard":
         try:
@@ -150,6 +151,7 @@ class _ExecutionGuard:
                 self._keepalive.start()
             self._timer = threading.Timer(self._budget, self._on_timeout)
             self._timer.start()
+            self._timer_started = True
         except BaseException:
             self._release()
             raise
@@ -174,7 +176,10 @@ class _ExecutionGuard:
         # tag removal below.
         if self._timer is not None:
             self._timer.cancel()
-            self._timer.join(timeout=5)
+            # A timer whose start() failed cannot be joined, and the join error
+            # would replace the exception that is being propagated.
+            if self._timer_started:
+                self._timer.join(timeout=5)
         if self._tagged:
             try:
                 self._spark.removeTag(self._tag)

@@ -1199,6 +1199,37 @@ class TestExecutionGuard:
         keepalive_cls.return_value.stop.assert_called_once()
         spark.removeTag.assert_called_once()
 
+    def test_failed_timer_start_propagates_original_error_and_removes_tag(
+        self, keepalive_cls, monkeypatch
+    ):
+        spark = MagicMock()
+
+        def failing_start(_timer):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Timer, "start", failing_start)
+
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            self._guard(spark).__enter__()
+
+        keepalive_cls.return_value.stop.assert_called_once()
+        spark.removeTag.assert_called_once()
+
+    def test_failed_keepalive_thread_start_propagates_original_error_and_removes_tag(
+        self, monkeypatch
+    ):
+        spark = MagicMock()
+
+        def failing_start(_thread):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", failing_start)
+
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            self._guard(spark).__enter__()
+
+        spark.removeTag.assert_called_once()
+
     def test_failed_add_tag_removes_no_tag(self, keepalive_cls):
         spark = MagicMock()
         spark.addTag.side_effect = RuntimeError("no tag")
