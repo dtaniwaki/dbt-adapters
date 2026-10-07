@@ -25,6 +25,7 @@ class _SessionInfo(TypedDict, total=False):
     load: int
     dpu: int
     draining: bool
+    idle_since: Optional[float]
     # Spark Connect client bound to this Athena session, shared by every
     # model that attaches to it. ``None`` until the first model creates it.
     spark: Optional[ConnectSparkSession]
@@ -134,6 +135,7 @@ class SparkConnectSessionPool:
             start_error: Optional[BaseException] = None
             budget_used = 0
             budget_ok = False
+            reclaimed_any = False
             with self._lock:
                 stale_entries = self._collect_stale_invocations(invocation_id)
                 reuse_candidate = self._attach(key, session_concurrency, skip)
@@ -146,7 +148,7 @@ class SparkConnectSessionPool:
                         )
                         if reclaimed:
                             stale_entries.extend(reclaimed)
-                            budget_used = self._used_dpu()
+                            reclaimed_any = True
                     budget_ok = budget_used + dpu_request <= dpu_budget
                     if budget_ok and has_room:
                         try:
@@ -173,6 +175,9 @@ class SparkConnectSessionPool:
                 self._terminate_entries(stale_entries)
             if start_error is not None:
                 raise start_error
+            # Athena counts a session against its limits until TerminateSession returns.
+            if reclaimed_any:
+                continue
 
             if pushback == "session_limit":
                 LOGGER.warning(
@@ -225,7 +230,8 @@ class SparkConnectSessionPool:
                 raise DbtRuntimeError(
                     f"No Spark Connect session available for key {key} within {timeout}s "
                     f"(max_sessions={max_sessions}, dpu_request={dpu_request}, "
-                    f"dpu_budget={dpu_budget}, last used_dpu={budget_used})"
+                    f"dpu_budget={dpu_budget}, last used_dpu={budget_used}, "
+                    f"draining={self._draining_count()}, unknown_state_skipped={len(skip)})"
                 )
 
             if pushback is not None:
@@ -312,8 +318,13 @@ class SparkConnectSessionPool:
                 continue
             if info["key"] == key and info["load"] < session_concurrency and not info["draining"]:
                 info["load"] += 1
+                info["idle_since"] = None
                 return sid
         return None
+
+    def _draining_count(self) -> int:
+        with self._lock:
+            return sum(1 for info in self._sessions.values() if info["draining"])
 
     def _has_room(self, key: SessionKey, max_sessions: int) -> bool:
         """Return True if per-key count < ``max_sessions``. Caller must hold ``self._lock``."""
@@ -363,6 +374,7 @@ class SparkConnectSessionPool:
             "load": 1,
             "dpu": dpu,
             "draining": False,
+            "idle_since": None,
             "spark": None,
         }
         return session_id
@@ -435,6 +447,8 @@ class SparkConnectSessionPool:
             if info is None:
                 return
             info["load"] = max(info["load"] - 1, 0)
+            if info["load"] == 0:
+                info["idle_since"] = time.monotonic()
             if info["load"] > 0 or not info["draining"]:
                 return
             self._sessions.pop(session_id, None)
@@ -503,9 +517,30 @@ class SparkConnectSessionPool:
             session_ids = list(self._sessions)
 
         evicted = 0
+        idle_timeout_seconds = SESSION_IDLE_TIMEOUT_MIN * 60
         for session_id in session_ids:
             state = self._session_state(session_id)
-            if state is not None and state in self._DEAD_SESSION_STATES:
+            if state is None:
+                with self._lock:
+                    info = self._sessions.get(session_id)
+                    idle_since = info.get("idle_since") if info is not None else None
+                    expired = (
+                        info is not None
+                        and info["load"] == 0
+                        and idle_since is not None
+                        and time.monotonic() - idle_since >= idle_timeout_seconds
+                    )
+                    if expired:
+                        self._sessions.pop(session_id, None)
+                if expired and info is not None:
+                    LOGGER.warning(
+                        f"Dropping Spark Connect session {session_id}: its state is unknown "
+                        f"and it has been idle longer than the session idle timeout"
+                    )
+                    self._terminate_entries([(session_id, info)])
+                    evicted += 1
+                continue
+            if state in self._DEAD_SESSION_STATES:
                 with self._lock:
                     info = self._sessions.pop(session_id, None)
                 if info is not None:
