@@ -10,6 +10,7 @@ import botocore.session
 import pytest
 from dbt_common.exceptions import DbtRuntimeError
 
+from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.python_submissions import AthenaPythonJobHelper
 from dbt.adapters.athena.spark_connect.job import SparkConnectSubmitter, _spark_max_executors
 from dbt.adapters.athena.spark_connect.session import SparkConnectSessionPool
@@ -39,25 +40,15 @@ class TestSparkConnectSubmission:
 
     @pytest.fixture
     def mock_credentials(self):
-        credentials = Mock()
-        credentials.aws_access_key_id = None
-        credentials.aws_secret_access_key = None
-        credentials.aws_session_token = None
-        credentials.region_name = "us-east-1"
-        credentials.aws_profile_name = None
-        credentials.assume_role_arn = None
-        credentials.spark_work_group = "test-workgroup"
-        credentials.spark_connect_max_sessions = 2
-        credentials.spark_connect_session_concurrency = None
-        credentials.spark_connect_dpu_budget = None
-        credentials.spark_connect_pool_acquire_timeout = None
-        credentials.spark_connect_max_retries = None
-        credentials.spark_connect_retry_on = None
-        credentials.spark_connect_keepalive_interval = None
-        credentials.poll_interval = 0.01
-        credentials.num_retries = 3
-        credentials.effective_num_retries = 3
-        return credentials
+        return AthenaCredentials(
+            database="db",
+            schema="schema",
+            region_name="us-east-1",
+            spark_work_group="test-workgroup",
+            spark_connect_max_sessions=2,
+            poll_interval=0.01,
+            num_retries=3,
+        )
 
     @pytest.fixture
     def spark_connect_parsed_model(self):
@@ -134,8 +125,7 @@ class TestSparkConnectSubmission:
             polling_interval=parsed_model["config"]["polling_interval"],
             relation_name=parsed_model.get("relation_name"),
         )
-        # Bypass the cached_property so the pool is fully mockable.
-        submitter.__dict__["_pool"] = mock_pool
+        submitter._pool = mock_pool
         return submitter
 
     def _stub_endpoint_and_channel(self, submitter, monkeypatch):
@@ -1042,16 +1032,42 @@ class TestDpuRequestComputation:
 
     @pytest.fixture
     def mock_credentials(self):
-        c = Mock()
-        c.spark_work_group = "wg"
-        c.spark_connect_dpu_budget = None
-        c.spark_connect_max_sessions = None
-        c.spark_connect_session_concurrency = None
-        c.spark_connect_pool_acquire_timeout = None
-        c.spark_connect_max_retries = None
-        c.spark_connect_retry_on = None
-        c.spark_connect_keepalive_interval = None
-        return c
+        return AthenaCredentials(
+            database="db", schema="schema", region_name="us-east-1", spark_work_group="wg"
+        )
+
+    def test_credentials_values_reach_pool_acquire(self, mock_credentials):
+        mock_credentials.spark_connect_max_sessions = 5
+        mock_credentials.spark_connect_session_concurrency = 3
+        mock_credentials.spark_connect_dpu_budget = 40
+        submitter = self._make_submitter_with_engine_config(
+            {"MaxConcurrentDpus": 4}, mock_credentials
+        )
+        submitter._pool = Mock()
+        submitter._pool.acquire.return_value = "sid"
+
+        assert submitter._acquire_session(12.5) == "sid"
+
+        kwargs = submitter._pool.acquire.call_args.kwargs
+        assert kwargs["max_sessions"] == 5
+        assert kwargs["session_concurrency"] == 3
+        assert kwargs["dpu_budget"] == 40
+        assert kwargs["dpu_request"] == 4
+        assert kwargs["timeout"] == 12.5
+
+    def test_empty_code_does_not_evaluate_engine_config(self, mock_credentials):
+        submitter = self._make_submitter_with_engine_config({}, mock_credentials)
+
+        assert submitter.submit("  \n") == {"SparkConnect": True, "SparkSessionId": None}
+
+    def test_derived_values_follow_current_inputs(self, mock_credentials):
+        submitter = self._make_submitter_with_engine_config(
+            {"MaxConcurrentDpus": 4}, mock_credentials
+        )
+        before = submitter._dpu_request
+        submitter.engine_config = {"MaxConcurrentDpus": 2}
+
+        assert (before, submitter._dpu_request) == (4, 2)
 
     def test_dpu_request_uses_min_of_dpus_and_executors_plus_driver(self, mock_credentials):
         ec = {
@@ -1085,49 +1101,6 @@ class TestDpuRequestComputation:
         ec = {"MaxConcurrentDpus": 4}
         submitter = self._make_submitter_with_engine_config(ec, mock_credentials)
         assert submitter._dpu_request == 4
-
-    def test_dpu_budget_defaults_when_credential_missing(self, mock_credentials):
-        from dbt.adapters.athena.constants import DEFAULT_SPARK_CONNECT_DPU_BUDGET
-
-        submitter = self._make_submitter_with_engine_config(
-            {"MaxConcurrentDpus": 2}, mock_credentials
-        )
-        assert submitter._dpu_budget == DEFAULT_SPARK_CONNECT_DPU_BUDGET
-
-    def test_dpu_budget_uses_credential_override(self, mock_credentials):
-        mock_credentials.spark_connect_dpu_budget = 80
-        submitter = self._make_submitter_with_engine_config(
-            {"MaxConcurrentDpus": 2}, mock_credentials
-        )
-        assert submitter._dpu_budget == 80
-
-    def test_pool_acquire_timeout_defaults_when_credential_missing(self, mock_credentials):
-        from dbt.adapters.athena.constants import DEFAULT_SPARK_CONNECT_POOL_ACQUIRE_TIMEOUT
-
-        submitter = self._make_submitter_with_engine_config(
-            {"MaxConcurrentDpus": 2}, mock_credentials
-        )
-        assert submitter._pool_acquire_timeout == DEFAULT_SPARK_CONNECT_POOL_ACQUIRE_TIMEOUT
-
-    def test_pool_acquire_timeout_uses_credential_override(self, mock_credentials):
-        mock_credentials.spark_connect_pool_acquire_timeout = 1800
-        submitter = self._make_submitter_with_engine_config(
-            {"MaxConcurrentDpus": 2}, mock_credentials
-        )
-        assert submitter._pool_acquire_timeout == 1800
-
-    def test_keepalive_interval_defaults_to_half_the_session_idle_timeout(self, mock_credentials):
-        submitter = self._make_submitter_with_engine_config(
-            {"MaxConcurrentDpus": 2}, mock_credentials
-        )
-        assert submitter._keepalive_interval == 300
-
-    def test_keepalive_interval_uses_credential_override(self, mock_credentials):
-        mock_credentials.spark_connect_keepalive_interval = 0
-        submitter = self._make_submitter_with_engine_config(
-            {"MaxConcurrentDpus": 2}, mock_credentials
-        )
-        assert submitter._keepalive_interval == 0
 
 
 class TestWaitForEndpoint:

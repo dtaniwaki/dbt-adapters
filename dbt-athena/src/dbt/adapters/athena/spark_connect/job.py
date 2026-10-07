@@ -9,13 +9,11 @@ import threading
 import time
 import traceback
 import uuid
-from functools import cached_property
 from hashlib import md5
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
-    FrozenSet,
     NamedTuple,
     Optional,
     Tuple,
@@ -42,14 +40,7 @@ from tenacity import (
 from dbt.adapters.athena.config import AthenaSparkSessionConfig
 from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.constants import (
-    DEFAULT_SPARK_CONNECT_DPU_BUDGET,
-    DEFAULT_SPARK_CONNECT_KEEPALIVE_INTERVAL,
-    DEFAULT_SPARK_CONNECT_MAX_RETRIES,
-    DEFAULT_SPARK_CONNECT_MAX_SESSIONS,
-    DEFAULT_SPARK_CONNECT_POOL_ACQUIRE_TIMEOUT,
-    DEFAULT_SPARK_CONNECT_SESSION_CONCURRENCY,
     LOGGER,
-    SPARK_CONNECT_RETRY_CATEGORIES,
 )
 from dbt.adapters.athena.exceptions import SparkSessionTerminatedError
 from dbt.adapters.athena.session import get_boto3_session_from_credentials
@@ -134,12 +125,9 @@ class SparkConnectSubmitter:
         self.timeout = timeout
         self.polling_interval = polling_interval
         self.relation_name = relation_name
+        self._pool = SparkConnectSessionPool()
 
-    @cached_property
-    def _pool(self) -> SparkConnectSessionPool:
-        return SparkConnectSessionPool()
-
-    @cached_property
+    @property
     def _session_fingerprint(self) -> str:
         """md5 of engine config + workgroup + engine version.
 
@@ -159,54 +147,11 @@ class SparkConnectSubmitter:
             usedforsecurity=False,
         ).hexdigest()
 
-    @cached_property
+    @property
     def _session_key(self) -> Tuple[str, str]:
         return (get_invocation_id(), self._session_fingerprint)
 
-    @cached_property
-    def _max_sessions(self) -> int:
-        return self.credentials.spark_connect_max_sessions or DEFAULT_SPARK_CONNECT_MAX_SESSIONS
-
-    @cached_property
-    def _session_concurrency(self) -> int:
-        return (
-            self.credentials.spark_connect_session_concurrency
-            or DEFAULT_SPARK_CONNECT_SESSION_CONCURRENCY
-        )
-
-    @cached_property
-    def _dpu_budget(self) -> int:
-        return self.credentials.spark_connect_dpu_budget or DEFAULT_SPARK_CONNECT_DPU_BUDGET
-
-    @cached_property
-    def _pool_acquire_timeout(self) -> float:
-        return (
-            self.credentials.spark_connect_pool_acquire_timeout
-            or DEFAULT_SPARK_CONNECT_POOL_ACQUIRE_TIMEOUT
-        )
-
-    @cached_property
-    def _max_retries(self) -> int:
-        value = self.credentials.spark_connect_max_retries
-        if value is None:
-            return DEFAULT_SPARK_CONNECT_MAX_RETRIES
-        return value
-
-    @cached_property
-    def _retry_on(self) -> FrozenSet[str]:
-        value = self.credentials.spark_connect_retry_on
-        if value is None:
-            return frozenset(SPARK_CONNECT_RETRY_CATEGORIES)
-        return frozenset(value)
-
-    @cached_property
-    def _keepalive_interval(self) -> int:
-        value = self.credentials.spark_connect_keepalive_interval
-        if value is None:
-            return DEFAULT_SPARK_CONNECT_KEEPALIVE_INTERVAL
-        return value
-
-    @cached_property
+    @property
     def _dpu_request(self) -> int:
         """DPUs reserved against the budget when starting a session.
 
@@ -220,7 +165,7 @@ class SparkConnectSubmitter:
             return max_concurrent
         return min(max_concurrent, max_executors + 1)
 
-    @cached_property
+    @property
     def _session_description(self) -> str:
         return f"dbt: {get_invocation_id()} - {self._session_fingerprint}"
 
@@ -245,7 +190,7 @@ class SparkConnectSubmitter:
         last_session_ended = False
         last_outcome: Optional[_AttemptResult] = None
         attempts_made = 0
-        total_attempts = self._max_retries + 1
+        total_attempts = self.credentials.effective_spark_connect_max_retries + 1
 
         for attempt in range(1, total_attempts + 1):
             outcome = self._attempt(compiled_code, attempt, pool_start)
@@ -328,12 +273,12 @@ class SparkConnectSubmitter:
             spark_work_group=spark_work_group,
             engine_config=self.engine_config,
             session_description=self._session_description,
-            max_sessions=self._max_sessions,
+            max_sessions=self.credentials.effective_spark_connect_max_sessions,
             timeout=pool_timeout,
             polling_interval=self.polling_interval,
-            session_concurrency=self._session_concurrency,
+            session_concurrency=self.credentials.effective_spark_connect_session_concurrency,
             dpu_request=self._dpu_request,
-            dpu_budget=self._dpu_budget,
+            dpu_budget=self.credentials.effective_spark_connect_dpu_budget,
         )
 
     def _wait_for_endpoint(
@@ -441,11 +386,13 @@ class SparkConnectSubmitter:
         pool_start: float,
     ) -> _AttemptResult:
         """Run one attempt; ``done=True`` on success, ``done=False`` on transient failure."""
-        pool_remaining = self._pool_acquire_timeout - (time.monotonic() - pool_start)
+        pool_remaining = self.credentials.effective_spark_connect_pool_acquire_timeout - (
+            time.monotonic() - pool_start
+        )
         if pool_remaining <= 0:
             raise DbtRuntimeError(
                 f"Spark Connect session pool acquire timed out after "
-                f"{self._pool_acquire_timeout} seconds."
+                f"{self.credentials.effective_spark_connect_pool_acquire_timeout} seconds."
             )
         session_id = self._acquire_session(pool_remaining)
 
@@ -483,8 +430,10 @@ class SparkConnectSubmitter:
 
             spark.addTag(model_tag)
             tagged = True
-            if self._keepalive_interval > 0:
-                keepalive = SessionKeepalive(spark, session_id, self._keepalive_interval)
+            if self.credentials.effective_spark_connect_keepalive_interval > 0:
+                keepalive = SessionKeepalive(
+                    spark, session_id, self.credentials.effective_spark_connect_keepalive_interval
+                )
                 keepalive.start()
             timer = threading.Timer(exec_remaining, _on_timeout)
             timer.start()
@@ -505,7 +454,7 @@ class SparkConnectSubmitter:
                 ) from e
 
             category = classify_transient_spark_error(e)
-            total_attempts = self._max_retries + 1
+            total_attempts = self.credentials.effective_spark_connect_max_retries + 1
             is_last_attempt = attempt >= total_attempts
 
             session_ended = (
@@ -514,7 +463,7 @@ class SparkConnectSubmitter:
             if session_ended:
                 category = SESSION_ENDED
             terminate_session = category is not None
-            retryable = category in self._retry_on
+            retryable = category in self.credentials.effective_spark_connect_retry_on
 
             if not retryable or is_last_attempt:
                 LOGGER.error(
