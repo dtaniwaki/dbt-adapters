@@ -19,6 +19,10 @@ SESSION_ENDED_PATTERNS = [
 
 TRANSIENT_SPARK_PATTERNS_BY_CATEGORY: Dict[str, List[str]] = {
     SESSION_ENDED: SESSION_ENDED_PATTERNS,
+    CAPACITY: [
+        # Account/workgroup session quota exhausted; retry after others finish.
+        "Maximum allowed sessions",
+    ],
     EXECUTOR_ENVIRONMENT: [
         # Spark executor failed to obtain credentials from the provider chain.
         "Unable to load credentials",
