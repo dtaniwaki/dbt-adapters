@@ -200,6 +200,10 @@ class SparkConnectSessionPool:
                 # Athena may have killed the session while it sat in the pool.
                 state = self._session_state(reuse_candidate)
                 if state is not None and state not in self._DEAD_SESSION_STATES:
+                    with self._lock:
+                        info = self._sessions.get(reuse_candidate)
+                        if info is not None:
+                            info["idle_since"] = None
                     LOGGER.debug(f"Reusing Spark Connect session {reuse_candidate} for key {key}")
                     return reuse_candidate
                 if state is None:
@@ -207,7 +211,7 @@ class SparkConnectSessionPool:
                         f"Spark Connect session {reuse_candidate} state is unknown; "
                         f"skipping it for this acquire"
                     )
-                    self.release(reuse_candidate)
+                    self._undo_attach(reuse_candidate)
                     skip.add(reuse_candidate)
                 else:
                     LOGGER.debug(
@@ -318,9 +322,14 @@ class SparkConnectSessionPool:
                 continue
             if info["key"] == key and info["load"] < session_concurrency and not info["draining"]:
                 info["load"] += 1
-                info["idle_since"] = None
                 return sid
         return None
+
+    def _undo_attach(self, session_id: str) -> None:
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if info is not None:
+                info["load"] = max(info["load"] - 1, 0)
 
     def _draining_count(self) -> int:
         with self._lock:

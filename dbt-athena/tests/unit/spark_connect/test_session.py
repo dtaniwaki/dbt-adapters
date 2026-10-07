@@ -264,17 +264,31 @@ class TestEviction:
         assert "sid-x" in pool._snapshot()
         client.terminate_session.assert_not_called()
 
-    def test_release_to_zero_load_starts_idle_clock_and_attach_clears_it(self):
+    def test_release_to_zero_load_starts_idle_clock_and_reuse_clears_it(self):
         pool = SparkConnectSessionPool()
-        _register(pool, "sid-x", ("inv", "fp"), MagicMock(), load=1)
+        client = MagicMock()
+        client.get_session_status.return_value = {"Status": {"State": "IDLE"}}
+        _register(pool, "sid-x", ("inv", "fp"), client, load=1)
 
         before = time.monotonic()
         pool.release("sid-x")
         assert pool._sessions["sid-x"]["idle_since"] >= before
 
-        with pool._lock:
-            assert pool._attach(("inv", "fp"), 1) == "sid-x"
+        assert _acquire(pool, MagicMock()) == "sid-x"
         assert pool._sessions["sid-x"]["idle_since"] is None
+
+    def test_unknown_same_key_session_past_idle_timeout_is_freed_during_acquire(self):
+        pool = SparkConnectSessionPool()
+        unknown = MagicMock()
+        unknown.get_session_status.side_effect = Exception("boom")
+        long_ago = time.monotonic() - session_module.SESSION_IDLE_TIMEOUT_MIN * 60 - 1
+        _register(pool, "sid-x", ("inv", "fp"), unknown, load=0, idle_since=long_ago)
+
+        sid = _acquire(pool, _make_client(["sid-new"]), max_sessions=1, timeout=2)
+
+        assert sid == "sid-new"
+        assert "sid-x" not in pool._snapshot()
+        unknown.terminate_session.assert_called_once_with(SessionId="sid-x")
 
     def test_release_with_remaining_load_keeps_idle_clock_unset(self):
         pool = SparkConnectSessionPool()
