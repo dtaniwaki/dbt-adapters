@@ -656,6 +656,214 @@ class TestDpuBudget:
         assert any("Another process may share" in w for w in warnings)
 
 
+class TestReclaimIdleForBudget:
+    @staticmethod
+    def _no_waiting(monkeypatch):
+        def fail(*_):
+            raise AssertionError("acquire waited instead of reclaiming")
+
+        monkeypatch.setattr(time, "sleep", fail)
+
+    def test_reclaims_idle_session_of_other_key_and_starts_without_waiting(self, monkeypatch):
+        self._no_waiting(monkeypatch)
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-idle", ("inv", "fp-a"), owner, dpu=8, load=0)
+        caller = _make_client(["sid-new"])
+
+        sid = _acquire(pool, caller, key=("inv", "fp-b"), dpu_request=4, dpu_budget=10)
+
+        assert sid == "sid-new"
+        owner.terminate_session.assert_called_once_with(SessionId="sid-idle")
+        caller.terminate_session.assert_not_called()
+        snapshot = pool._snapshot()
+        assert "sid-idle" not in snapshot
+        assert snapshot["sid-new"]["load"] == 1
+
+    def test_logs_reclaimed_session_and_dpus(self, monkeypatch):
+        pool = SparkConnectSessionPool()
+        _register(pool, "sid-idle", ("inv", "fp-a"), MagicMock(), dpu=8, load=0)
+        infos: list[str] = []
+        monkeypatch.setattr(
+            session_module.LOGGER, "info", lambda msg, *a, **k: infos.append(str(msg))
+        )
+
+        _acquire(
+            pool, _make_client(["sid-new"]), key=("inv", "fp-b"), dpu_request=4, dpu_budget=10
+        )
+
+        assert len(infos) == 1
+        assert "sid-idle" in infos[0]
+        assert "8 DPUs" in infos[0]
+
+    def test_reclaims_oldest_first_and_only_as_many_as_needed(self, monkeypatch):
+        self._no_waiting(monkeypatch)
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-1", ("inv", "fp-a"), owner, dpu=4, load=0)
+        _register(pool, "sid-2", ("inv", "fp-b"), owner, dpu=4, load=0)
+        _register(pool, "sid-3", ("inv", "fp-c"), owner, dpu=2, load=0)
+
+        _acquire(
+            pool, _make_client(["sid-new"]), key=("inv", "fp-d"), dpu_request=4, dpu_budget=10
+        )
+
+        owner.terminate_session.assert_called_once_with(SessionId="sid-1")
+        assert set(pool._snapshot()) == {"sid-2", "sid-3", "sid-new"}
+
+    def test_reclaims_several_when_one_is_not_enough(self, monkeypatch):
+        self._no_waiting(monkeypatch)
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-1", ("inv", "fp-a"), owner, dpu=3, load=0)
+        _register(pool, "sid-2", ("inv", "fp-b"), owner, dpu=3, load=0)
+        _register(pool, "sid-3", ("inv", "fp-c"), owner, dpu=4, load=0)
+
+        _acquire(
+            pool, _make_client(["sid-new"]), key=("inv", "fp-d"), dpu_request=6, dpu_budget=10
+        )
+
+        assert owner.terminate_session.call_count == 2
+        assert set(pool._snapshot()) == {"sid-3", "sid-new"}
+
+    def test_does_not_reclaim_sessions_that_are_in_use(self):
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-busy", ("inv", "fp-a"), owner, dpu=8, load=1)
+        caller = _make_client(["sid-new"])
+
+        with pytest.raises(DbtRuntimeError, match="No Spark Connect session available"):
+            _acquire(
+                pool,
+                caller,
+                key=("inv", "fp-b"),
+                dpu_request=4,
+                dpu_budget=10,
+                timeout=0.05,
+            )
+
+        owner.terminate_session.assert_not_called()
+        caller.start_session.assert_not_called()
+        assert "sid-busy" in pool._snapshot()
+
+    def test_reclaims_nothing_when_idle_sessions_cannot_free_enough(self):
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-idle", ("inv", "fp-a"), owner, dpu=2, load=0)
+        _register(pool, "sid-busy", ("inv", "fp-b"), owner, dpu=8, load=1)
+
+        with pytest.raises(DbtRuntimeError, match="No Spark Connect session available"):
+            _acquire(
+                pool,
+                _make_client(["sid-new"]),
+                key=("inv", "fp-c"),
+                dpu_request=4,
+                dpu_budget=10,
+                timeout=0.05,
+            )
+
+        owner.terminate_session.assert_not_called()
+        assert "sid-idle" in pool._snapshot()
+
+    def test_reclaims_nothing_when_key_has_no_room(self):
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-idle", ("inv", "fp-a"), owner, dpu=9, load=0)
+        _register(pool, "sid-own", ("inv", "fp-b"), MagicMock(), dpu=1, load=1)
+
+        with pytest.raises(DbtRuntimeError, match="No Spark Connect session available"):
+            _acquire(
+                pool,
+                _make_client(["sid-new"]),
+                key=("inv", "fp-b"),
+                max_sessions=1,
+                dpu_request=4,
+                dpu_budget=10,
+                timeout=0.05,
+            )
+
+        owner.terminate_session.assert_not_called()
+        assert "sid-idle" in pool._snapshot()
+
+    def test_does_not_reclaim_idle_session_of_same_key(self):
+        pool = SparkConnectSessionPool()
+        own = MagicMock()
+        own.get_session_status.side_effect = Exception("boom")
+        _register(pool, "sid-own", ("inv", "fp-a"), own, dpu=9, load=0)
+
+        with pytest.raises(DbtRuntimeError, match="No Spark Connect session available"):
+            _acquire(
+                pool,
+                _make_client(["sid-new"]),
+                key=("inv", "fp-a"),
+                max_sessions=3,
+                dpu_request=4,
+                dpu_budget=10,
+                timeout=0.05,
+            )
+
+        own.terminate_session.assert_not_called()
+        assert "sid-own" in pool._snapshot()
+
+    def test_does_not_reclaim_draining_session(self):
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-draining", ("inv", "fp-a"), owner, dpu=8, load=0)
+        pool._sessions["sid-draining"]["draining"] = True
+
+        with pytest.raises(DbtRuntimeError, match="No Spark Connect session available"):
+            _acquire(
+                pool,
+                _make_client(["sid-new"]),
+                key=("inv", "fp-b"),
+                dpu_request=4,
+                dpu_budget=10,
+                timeout=0.05,
+            )
+
+        owner.terminate_session.assert_not_called()
+
+    def test_prefers_reusing_idle_session_of_same_key(self):
+        pool = SparkConnectSessionPool()
+        other = MagicMock()
+        own = MagicMock()
+        own.get_session_status.return_value = {"Status": {"State": "IDLE"}}
+        _register(pool, "sid-other", ("inv", "fp-a"), other, dpu=8, load=0)
+        _register(pool, "sid-own", ("inv", "fp-b"), own, dpu=2, load=0)
+        caller = _make_client(["sid-new"])
+
+        sid = _acquire(pool, caller, key=("inv", "fp-b"), dpu_request=4, dpu_budget=10)
+
+        assert sid == "sid-own"
+        other.terminate_session.assert_not_called()
+        caller.start_session.assert_not_called()
+        assert "sid-other" in pool._snapshot()
+
+    def test_does_not_reclaim_when_budget_already_fits(self):
+        pool = SparkConnectSessionPool()
+        owner = MagicMock()
+        _register(pool, "sid-idle", ("inv", "fp-a"), owner, dpu=4, load=0)
+
+        _acquire(
+            pool, _make_client(["sid-new"]), key=("inv", "fp-b"), dpu_request=4, dpu_budget=10
+        )
+
+        owner.terminate_session.assert_not_called()
+        assert "sid-idle" in pool._snapshot()
+
+    def test_reclaimed_session_stops_its_spark_client(self):
+        pool = SparkConnectSessionPool()
+        _register(pool, "sid-idle", ("inv", "fp-a"), MagicMock(), dpu=8, load=0)
+        spark = MagicMock()
+        pool.set_spark("sid-idle", spark)
+
+        _acquire(
+            pool, _make_client(["sid-new"]), key=("inv", "fp-b"), dpu_request=4, dpu_budget=10
+        )
+
+        spark.stop.assert_called_once()
+
+
 class TestAccountCapacityUnavailable:
     def test_retries_on_required_capacity_not_available(self, monkeypatch):
         pool = SparkConnectSessionPool()

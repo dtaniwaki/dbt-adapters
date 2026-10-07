@@ -139,8 +139,16 @@ class SparkConnectSessionPool:
                 reuse_candidate = self._attach(key, session_concurrency, skip)
                 if reuse_candidate is None:
                     budget_used = self._used_dpu()
+                    has_room = self._has_room(key, max_sessions)
+                    if has_room and budget_used + dpu_request > dpu_budget:
+                        reclaimed = self._reclaim_idle_for_budget(
+                            key, dpu_request, dpu_budget, budget_used
+                        )
+                        if reclaimed:
+                            stale_entries.extend(reclaimed)
+                            budget_used = self._used_dpu()
                     budget_ok = budget_used + dpu_request <= dpu_budget
-                    if budget_ok and self._has_room(key, max_sessions):
+                    if budget_ok and has_room:
                         try:
                             new_session_id = self._start(
                                 key,
@@ -263,6 +271,32 @@ class SparkConnectSessionPool:
                 f"Draining {newly_draining} in-use Spark Connect sessions from prior invocations"
             )
         return idle
+
+    def _reclaim_idle_for_budget(
+        self, key: SessionKey, dpu_request: int, dpu_budget: int, used_dpu: int
+    ) -> List[Tuple[str, _SessionInfo]]:
+        """Pop the oldest idle sessions of other keys that free enough DPUs for ``key``.
+
+        Caller must hold ``self._lock`` and terminate the returned entries
+        outside it. Pops nothing unless the idle sessions can free enough.
+        """
+        shortfall = used_dpu + dpu_request - dpu_budget
+        chosen: List[str] = []
+        freed = 0
+        for sid, info in self._sessions.items():
+            if info["key"] == key or info["load"] > 0 or info["draining"]:
+                continue
+            chosen.append(sid)
+            freed += info["dpu"]
+            if freed >= shortfall:
+                break
+        if freed < shortfall:
+            return []
+        LOGGER.info(
+            f"Reclaiming {len(chosen)} idle Spark Connect session(s) {chosen} "
+            f"({freed} DPUs) of other keys to start a session for key {key}"
+        )
+        return [(sid, self._sessions.pop(sid)) for sid in chosen]
 
     def _attach(
         self, key: SessionKey, session_concurrency: int, skip: Optional[Set[str]] = None
