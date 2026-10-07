@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from dbt.adapters.events.logging import AdapterLogger
 
 DEFAULT_THREAD_COUNT = 4
+SPARK_CONNECT_ENGINE_VERSION = "3.5"
 DEFAULT_SPARK_CONNECT_MAX_SESSIONS = 4
 DEFAULT_SPARK_CONNECT_SESSION_CONCURRENCY = 1
 # Spark 3.5 quota "On-demand DPUs per account" (L-E20AD6B8). Adjustable via
