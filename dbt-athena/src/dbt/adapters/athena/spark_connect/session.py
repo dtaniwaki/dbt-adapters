@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import threading
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, TypedDict
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, TypedDict
 
 from dbt_common.exceptions import DbtRuntimeError
 from mypy_boto3_athena.client import AthenaClient
@@ -126,6 +126,7 @@ class SparkConnectSessionPool:
         deadline = time.monotonic() + timeout
         time_since_eviction = self._EVICTION_INTERVAL  # evict on first pass
         pushback_attempts = 0
+        skip: Set[str] = set()
 
         while True:
             new_session_id: Optional[str] = None
@@ -135,7 +136,7 @@ class SparkConnectSessionPool:
             budget_ok = False
             with self._lock:
                 stale_entries = self._collect_stale_invocations(invocation_id)
-                reuse_candidate = self._attach(key, session_concurrency)
+                reuse_candidate = self._attach(key, session_concurrency, skip)
                 if reuse_candidate is None:
                     budget_used = self._used_dpu()
                     budget_ok = budget_used + dpu_request <= dpu_budget
@@ -184,13 +185,22 @@ class SparkConnectSessionPool:
 
             if reuse_candidate is not None:
                 # Athena may have killed the session while it sat in the pool.
-                if self.is_session_alive(athena_client, reuse_candidate):
+                state = self._session_state(reuse_candidate)
+                if state is not None and state not in self._DEAD_SESSION_STATES:
                     LOGGER.debug(f"Reusing Spark Connect session {reuse_candidate} for key {key}")
                     return reuse_candidate
-                LOGGER.debug(
-                    f"Discarding stale Spark Connect session {reuse_candidate} during reuse"
-                )
-                self.unregister(reuse_candidate)
+                if state is None:
+                    LOGGER.debug(
+                        f"Spark Connect session {reuse_candidate} state is unknown; "
+                        f"skipping it for this acquire"
+                    )
+                    self.release(reuse_candidate)
+                    skip.add(reuse_candidate)
+                else:
+                    LOGGER.debug(
+                        f"Discarding stale Spark Connect session {reuse_candidate} during reuse"
+                    )
+                    self.unregister(reuse_candidate)
                 continue
 
             if new_session_id is not None:
@@ -198,7 +208,7 @@ class SparkConnectSessionPool:
 
             # Periodically evict dead sessions so stuck slots don't block.
             if time_since_eviction >= self._EVICTION_INTERVAL:
-                evicted = self._evict_dead_sessions(athena_client)
+                evicted = self._evict_dead_sessions()
                 time_since_eviction = 0
                 if evicted:
                     continue
@@ -242,13 +252,18 @@ class SparkConnectSessionPool:
         )
         return [(sid, self._sessions.pop(sid)) for sid in stale_sids]
 
-    def _attach(self, key: SessionKey, session_concurrency: int) -> Optional[str]:
+    def _attach(
+        self, key: SessionKey, session_concurrency: int, skip: Optional[Set[str]] = None
+    ) -> Optional[str]:
         """Attach to a reusable session by incrementing its load.
 
         Caller must hold ``self._lock``. Increments load before the
         out-of-lock liveness check to prevent oversubscription.
         """
+        skip = skip or set()
         for sid, info in self._sessions.items():
+            if sid in skip:
+                continue
             if info["key"] == key and info["load"] < session_concurrency and not info["draining"]:
                 info["load"] += 1
                 return sid
@@ -339,20 +354,28 @@ class SparkConnectSessionPool:
             info["spark"] = spark
             return spark
 
-    def _get_session_state(self, athena_client: AthenaClient, session_id: str) -> str:
-        """Return the Athena session state, or empty string on lookup failure."""
+    def _get_session_state(self, athena_client: AthenaClient, session_id: str) -> Optional[str]:
+        """Return the Athena session state, or ``None`` when it cannot be determined."""
         try:
-            return athena_client.get_session_status(SessionId=session_id)["Status"].get(
-                "State", ""
-            )
-        except Exception as e:  # noqa: BLE001 - treat unknown state as dead
+            state = athena_client.get_session_status(SessionId=session_id)["Status"].get("State")
+        except Exception as e:  # noqa: BLE001 - unknown state is not evidence of death
             LOGGER.warning(f"Could not verify Spark Connect session {session_id} state: {e}")
-            return ""
+            return None
+        return state or None
 
-    def is_session_alive(self, athena_client: AthenaClient, session_id: str) -> bool:
+    def _session_state(self, session_id: str) -> Optional[str]:
+        """Look up the state with the client that started the session."""
+        with self._lock:
+            info = self._sessions.get(session_id)
+            client = info["client"] if info is not None else None
+        if client is None:
+            return None
+        return self._get_session_state(client, session_id)
+
+    def is_session_alive(self, session_id: str) -> bool:
         """Return True if Athena reports the session as IDLE/BUSY/CREATED."""
-        state = self._get_session_state(athena_client, session_id)
-        return bool(state) and state not in self._DEAD_SESSION_STATES
+        state = self._session_state(session_id)
+        return state is not None and state not in self._DEAD_SESSION_STATES
 
     def release(self, session_id: str) -> None:
         """Mark the session as idle so it can be reused.
@@ -425,15 +448,18 @@ class SparkConnectSessionPool:
             except Exception as e:  # noqa: BLE001 - best-effort cleanup
                 LOGGER.warning(f"Failed to terminate Spark Connect session {session_id}: {e}")
 
-    def _evict_dead_sessions(self, athena_client: AthenaClient) -> int:
-        """Remove sessions that Athena has already terminated or degraded."""
+    def _evict_dead_sessions(self) -> int:
+        """Remove sessions that Athena reports as terminated or degraded.
+
+        Sessions whose state cannot be determined are kept.
+        """
         with self._lock:
             session_ids = list(self._sessions)
 
         evicted = 0
         for session_id in session_ids:
-            state = self._get_session_state(athena_client, session_id)
-            if not state or state in self._DEAD_SESSION_STATES:
+            state = self._session_state(session_id)
+            if state is not None and state in self._DEAD_SESSION_STATES:
                 with self._lock:
                     info = self._sessions.pop(session_id, None)
                 if info is not None:
