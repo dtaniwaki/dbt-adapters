@@ -567,7 +567,7 @@ class TestSparkConnectSubmission:
             assert submitter.submit("spark.run()")["SparkSessionId"] == "sid-2"
             assert mock_pool.acquire.call_count == 2
         else:
-            with pytest.raises(DbtRuntimeError, match="failed after 1 attempts"):
+            with pytest.raises(DbtRuntimeError, match="not in spark_connect_retry_on"):
                 submitter.submit("spark.run()")
             assert mock_pool.acquire.call_count == 1
         mock_pool.terminate.assert_called_once_with("sid-1")
@@ -598,7 +598,9 @@ class TestSparkConnectSubmission:
         if retried:
             assert submitter.submit("spark.run()")["SparkSessionId"] == "sid-2"
         else:
-            with pytest.raises(DbtRuntimeError, match="failed after 1 attempts"):
+            with pytest.raises(
+                DbtRuntimeError, match="category 'connection' is not in spark_connect_retry_on"
+            ):
                 submitter.submit("spark.run()")
         assert mock_pool.acquire.call_count == (2 if retried else 1)
 

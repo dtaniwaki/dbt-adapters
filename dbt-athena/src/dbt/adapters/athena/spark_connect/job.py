@@ -109,6 +109,7 @@ class _AttemptResult(NamedTuple):
     session_id: Optional[str] = None
     session_ended: bool = False
     retryable: bool = True
+    category: Optional[str] = None
 
 
 class SparkConnectSubmitter:
@@ -233,6 +234,7 @@ class SparkConnectSubmitter:
         last_error: Optional[BaseException] = None
         last_session_id: Optional[str] = None
         last_session_ended = False
+        last_outcome: Optional[_AttemptResult] = None
         attempts_made = 0
         total_attempts = self._max_retries + 1
 
@@ -245,6 +247,7 @@ class SparkConnectSubmitter:
             last_error = outcome.error
             last_session_id = outcome.session_id
             last_session_ended = outcome.session_ended
+            last_outcome = outcome
             attempts_made = attempt
 
             is_last_attempt = attempt >= total_attempts
@@ -275,6 +278,12 @@ class SparkConnectSubmitter:
                 f"Athena terminated Spark session {last_session_id}; "
                 f"check session state and workgroup DPU/quota. "
                 f"Underlying error: {type(last_error).__name__}: {last_error}"
+            ) from last_error
+        if last_outcome is not None and not last_outcome.retryable:
+            raise DbtRuntimeError(
+                f"Spark Connect execution failed (session {last_session_id}); not retried "
+                f"because transient category '{last_outcome.category}' is not in "
+                f"spark_connect_retry_on: {type(last_error).__name__}: {last_error}"
             ) from last_error
         raise DbtRuntimeError(
             f"Spark Connect execution failed after {attempts_made} "
@@ -499,7 +508,8 @@ class SparkConnectSubmitter:
                     f"Model {self.relation_name} (session {session_id}) - "
                     f"Spark Connect execution failed "
                     f"(attempt {attempt}/{total_attempts}, "
-                    f"transient category: {category}): "
+                    f"transient category: {category}"
+                    f"{'' if retryable or category is None else ', excluded by spark_connect_retry_on'}): "
                     f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                 )
                 if category is None:
@@ -515,6 +525,7 @@ class SparkConnectSubmitter:
                 session_id=session_id,
                 session_ended=session_ended,
                 retryable=retryable,
+                category=category,
             )
         finally:
             # Cancel the watchdog timer first and wait for any already-fired
