@@ -439,7 +439,7 @@ class TestCrossInvocationCleanup:
     def test_sessions_from_prior_invocations_are_evicted_on_acquire(self):
         pool = SparkConnectSessionPool()
         stale_client = MagicMock()
-        _register(pool, "sid-stale", ("old-inv", "fp"), stale_client)
+        _register(pool, "sid-stale", ("old-inv", "fp"), stale_client, load=0)
 
         new_client = _make_client(["sid-new"])
         sid = _acquire(pool, new_client, key=("new-inv", "fp"), max_sessions=1)
@@ -454,7 +454,7 @@ class TestCrossInvocationCleanup:
         """Non-transient start_session failures must not leak prior-invocation sessions."""
         pool = SparkConnectSessionPool()
         stale_client = MagicMock()
-        _register(pool, "sid-stale", ("old-inv", "fp"), stale_client)
+        _register(pool, "sid-stale", ("old-inv", "fp"), stale_client, load=0)
 
         new_client = MagicMock()
         new_client.start_session.side_effect = Exception("AccessDeniedException: nope")
@@ -464,6 +464,81 @@ class TestCrossInvocationCleanup:
 
         stale_client.terminate_session.assert_called_once_with(SessionId="sid-stale")
         assert "sid-stale" not in pool._snapshot()
+
+
+class TestStaleInvocationDrain:
+    def test_busy_stale_session_is_drained_not_terminated(self):
+        pool = SparkConnectSessionPool()
+        old_client = MagicMock()
+        _register(pool, "sid-busy", ("old-inv", "fp"), old_client, load=1)
+
+        sid = _acquire(pool, _make_client(["sid-new"]), key=("new-inv", "fp"))
+
+        assert sid == "sid-new"
+        old_client.terminate_session.assert_not_called()
+        info = pool._snapshot()["sid-busy"]
+        assert info["draining"] is True
+        assert info["load"] == 1
+
+    def test_idle_stale_session_is_terminated(self):
+        pool = SparkConnectSessionPool()
+        old_client = MagicMock()
+        _register(pool, "sid-idle", ("old-inv", "fp"), old_client, load=0)
+
+        _acquire(pool, _make_client(["sid-new"]), key=("new-inv", "fp"))
+
+        old_client.terminate_session.assert_called_once_with(SessionId="sid-idle")
+        assert "sid-idle" not in pool._snapshot()
+
+    def test_drained_session_is_terminated_by_last_release(self):
+        pool = SparkConnectSessionPool()
+        old_client = MagicMock()
+        _register(pool, "sid-busy", ("old-inv", "fp"), old_client, load=1)
+        _acquire(pool, _make_client(["sid-new"]), key=("new-inv", "fp"))
+
+        pool.release("sid-busy")
+
+        old_client.terminate_session.assert_called_once_with(SessionId="sid-busy")
+        assert "sid-busy" not in pool._snapshot()
+
+    def test_drained_session_stays_until_every_caller_releases(self):
+        pool = SparkConnectSessionPool()
+        old_client = MagicMock()
+        _register(pool, "sid-busy", ("old-inv", "fp"), old_client, load=2)
+        _acquire(pool, _make_client(["sid-new"]), key=("new-inv", "fp"))
+
+        pool.release("sid-busy")
+        old_client.terminate_session.assert_not_called()
+        pool.release("sid-busy")
+
+        old_client.terminate_session.assert_called_once_with(SessionId="sid-busy")
+
+    def test_drained_session_is_not_attached(self):
+        pool = SparkConnectSessionPool()
+        _register(pool, "sid-busy", ("old-inv", "fp"), MagicMock(), load=1)
+        _acquire(pool, _make_client(["sid-new"]), key=("new-inv", "fp"))
+
+        assert pool._attach(("old-inv", "fp"), session_concurrency=5) is None
+        assert pool._snapshot()["sid-busy"]["load"] == 1
+
+    def test_drained_session_still_counts_toward_dpu_budget(self):
+        pool = SparkConnectSessionPool()
+        old_client = MagicMock()
+        _register(pool, "sid-busy", ("old-inv", "fp"), old_client, dpu=8, load=1)
+        new_client = _make_client(["sid-new"])
+
+        with pytest.raises(DbtRuntimeError, match="No Spark Connect session available"):
+            _acquire(
+                pool,
+                new_client,
+                key=("new-inv", "fp"),
+                dpu_request=4,
+                dpu_budget=10,
+                timeout=0.05,
+            )
+
+        new_client.start_session.assert_not_called()
+        assert pool._used_dpu() == 8
 
 
 class TestDpuBudget:
@@ -940,7 +1015,7 @@ class TestSparkClientBinding:
     def test_stale_invocation_cleanup_stops_client(self):
         pool = SparkConnectSessionPool()
         old_client = MagicMock()
-        _register(pool, "sid-stale", ("old-inv", "fp"), old_client)
+        _register(pool, "sid-stale", ("old-inv", "fp"), old_client, load=0)
         spark = MagicMock()
         pool.set_spark("sid-stale", spark)
 

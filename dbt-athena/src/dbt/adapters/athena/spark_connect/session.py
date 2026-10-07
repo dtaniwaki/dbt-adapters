@@ -238,19 +238,31 @@ class SparkConnectSessionPool:
         return random.uniform(0, ceiling)
 
     def _collect_stale_invocations(self, invocation_id: str) -> List[Tuple[str, _SessionInfo]]:
-        """Pop sessions from prior invocations. Caller must hold ``self._lock``.
+        """Pop idle sessions from prior invocations and drain busy ones.
 
-        Prevents cruft across dbt runs in long-lived processes (e.g. dbt Cloud).
+        Caller must hold ``self._lock``. Prevents cruft across dbt runs in
+        long-lived processes (e.g. dbt Cloud). A session another invocation is
+        still using is only marked draining; its last ``release`` terminates it.
         """
-        stale_sids = [
-            sid for sid, info in self._sessions.items() if info["key"][0] != invocation_id
-        ]
-        if not stale_sids:
-            return []
-        LOGGER.debug(
-            f"Removing {len(stale_sids)} stale Spark Connect sessions from prior invocations"
-        )
-        return [(sid, self._sessions.pop(sid)) for sid in stale_sids]
+        idle: List[Tuple[str, _SessionInfo]] = []
+        newly_draining = 0
+        for sid, info in list(self._sessions.items()):
+            if info["key"][0] == invocation_id:
+                continue
+            if info["load"] == 0:
+                idle.append((sid, self._sessions.pop(sid)))
+            elif not info["draining"]:
+                info["draining"] = True
+                newly_draining += 1
+        if idle:
+            LOGGER.debug(
+                f"Removing {len(idle)} stale Spark Connect sessions from prior invocations"
+            )
+        if newly_draining:
+            LOGGER.debug(
+                f"Draining {newly_draining} in-use Spark Connect sessions from prior invocations"
+            )
+        return idle
 
     def _attach(
         self, key: SessionKey, session_concurrency: int, skip: Optional[Set[str]] = None
