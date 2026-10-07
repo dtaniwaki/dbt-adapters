@@ -1052,8 +1052,10 @@ class TestTransientAttemptFailure:
         assert (failure.category, failure.session_ended) == ("connection", False)
 
     def test_unclassified_error_is_not_transient(self, submitter):
-        with pytest.raises(DbtRuntimeError, match=r"failed \(session sid-1\): ValueError: boom"):
-            self._classify(submitter, ValueError("boom"))
+        error = self._classify(submitter, ValueError("boom"))
+
+        assert isinstance(error, DbtRuntimeError)
+        assert re.search(r"failed \(session sid-1\): ValueError: boom", str(error))
 
     def test_attempt_raises_failure_and_terminates_session(self, submitter, monkeypatch):
         submitter._pool.acquire.return_value = "sid-1"
@@ -1066,6 +1068,41 @@ class TestTransientAttemptFailure:
         assert excinfo.value.category == "connection"
         submitter._pool.terminate.assert_called_once_with("sid-1")
         submitter._pool.release.assert_not_called()
+
+    def test_attempt_classifies_before_guard_cleanup(self, submitter, monkeypatch):
+        submitter._pool.acquire.return_value = "sid-1"
+        spark = MagicMock()
+        monkeypatch.setattr(submitter, "_get_or_create_spark", Mock(return_value=spark))
+        calls = []
+        spark.removeTag.side_effect = lambda *_: calls.append("removeTag")
+        original_failure_for = submitter._failure_for
+
+        def failure_for(*args, **kwargs):
+            calls.append("classify")
+            return original_failure_for(*args, **kwargs)
+
+        monkeypatch.setattr(submitter, "_failure_for", failure_for)
+
+        with pytest.raises(_TransientAttemptFailure):
+            submitter._attempt("raise Exception('Pool not running')", 1, time.monotonic())
+
+        assert calls == ["classify", "removeTag"]
+
+    def test_watchdog_firing_during_cleanup_does_not_turn_failure_into_timeout(
+        self, submitter, monkeypatch
+    ):
+        submitter._pool.acquire.return_value = "sid-1"
+        monkeypatch.setattr(submitter, "_get_or_create_spark", Mock(return_value=MagicMock()))
+        original_release = _ExecutionGuard._release
+
+        def release_then_fire(guard):
+            guard._timeout_event.set()
+            original_release(guard)
+
+        monkeypatch.setattr(_ExecutionGuard, "_release", release_then_fire)
+
+        with pytest.raises(_TransientAttemptFailure):
+            submitter._attempt("raise Exception('Pool not running')", 1, time.monotonic())
 
     def test_attempt_releases_session_for_unclassified_error(self, submitter, monkeypatch):
         submitter._pool.acquire.return_value = "sid-1"

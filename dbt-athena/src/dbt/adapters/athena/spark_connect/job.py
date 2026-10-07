@@ -16,6 +16,7 @@ from typing import (
     Optional,
     Tuple,
     TypedDict,
+    Union,
 )
 
 import boto3
@@ -461,38 +462,43 @@ class SparkConnectSubmitter:
         terminate_session = False
 
         try:
-            try:
-                spark = self._get_or_create_spark(session_id)
+            spark = self._get_or_create_spark(session_id)
 
-                budget = self.timeout - (time.monotonic() - attempt_start)
-                if budget <= 0:
-                    raise DbtRuntimeError(
-                        f"Spark Connect execution timed out after {self.timeout} seconds."
-                    )
-
-                guard = _ExecutionGuard(
-                    spark,
-                    session_id,
-                    self.relation_name,
-                    self.timeout,
-                    budget,
-                    self.credentials.effective_spark_connect_keepalive_interval,
-                    timeout_event,
+            budget = self.timeout - (time.monotonic() - attempt_start)
+            if budget <= 0:
+                raise DbtRuntimeError(
+                    f"Spark Connect execution timed out after {self.timeout} seconds."
                 )
-                with guard:
-                    exec_globals: Dict[str, Any] = {"spark": spark}
+
+            guard = _ExecutionGuard(
+                spark,
+                session_id,
+                self.relation_name,
+                self.timeout,
+                budget,
+                self.credentials.effective_spark_connect_keepalive_interval,
+                timeout_event,
+            )
+            with guard:
+                exec_globals: Dict[str, Any] = {"spark": spark}
+                try:
                     exec(compiled_code, exec_globals)  # noqa: S102 - user model code
-                return SparkConnectResult(SparkConnect=True, SparkSessionId=session_id)
-            except DbtRuntimeError:
-                raise
-            except Exception as e:
-                if timeout_event.is_set():
-                    raise DbtRuntimeError(
-                        f"Spark Connect execution timed out after {self.timeout} seconds."
-                    ) from e
-                failure = self._classify_failure(e, session_id, attempt)
-                terminate_session = True
-                raise failure from e
+                except DbtRuntimeError:
+                    raise
+                except Exception as e:
+                    # Classify before the guard's cleanup so a watchdog firing
+                    # during cleanup cannot turn this failure into a timeout.
+                    raise self._failure_for(e, session_id, attempt, timeout_event) from e
+            return SparkConnectResult(SparkConnect=True, SparkSessionId=session_id)
+        except _TransientAttemptFailure:
+            terminate_session = True
+            raise
+        except DbtRuntimeError:
+            raise
+        except Exception as e:
+            failure = self._failure_for(e, session_id, attempt, timeout_event)
+            terminate_session = isinstance(failure, _TransientAttemptFailure)
+            raise failure from e
         finally:
             # The client stays bound to the Athena session; the pool stops it
             # when the session is terminated or evicted.
@@ -501,9 +507,18 @@ class SparkConnectSubmitter:
             else:
                 self._pool.release(session_id)
 
+    def _failure_for(
+        self, e: Exception, session_id: str, attempt: int, timeout_event: threading.Event
+    ) -> Exception:
+        if timeout_event.is_set():
+            return DbtRuntimeError(
+                f"Spark Connect execution timed out after {self.timeout} seconds."
+            )
+        return self._classify_failure(e, session_id, attempt)
+
     def _classify_failure(
         self, e: Exception, session_id: str, attempt: int
-    ) -> _TransientAttemptFailure:
+    ) -> Union[DbtRuntimeError, _TransientAttemptFailure]:
         category = classify_transient_spark_error(e)
         total_attempts = self.credentials.effective_spark_connect_max_retries + 1
         is_last_attempt = attempt >= total_attempts
@@ -526,8 +541,8 @@ class SparkConnectSubmitter:
             )
 
         if category is None:
-            raise DbtRuntimeError(
+            return DbtRuntimeError(
                 f"Spark Connect execution failed (session {session_id}): "
                 f"{type(e).__name__}: {e}"
-            ) from e
+            )
         return _TransientAttemptFailure(e, session_id, session_ended, retryable, category)
