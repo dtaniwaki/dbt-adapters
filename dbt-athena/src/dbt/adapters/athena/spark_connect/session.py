@@ -529,7 +529,7 @@ class SparkConnectSessionPool:
                 LOGGER.warning(f"Failed to terminate Spark Connect session {session_id}: {e}")
 
     def _evict_dead_sessions(self) -> int:
-        """Sessions with an unknown state are kept."""
+        """Sessions with an unknown state are kept until idle past the session idle timeout."""
         with self._lock:
             session_ids = list(self._sessions)
 

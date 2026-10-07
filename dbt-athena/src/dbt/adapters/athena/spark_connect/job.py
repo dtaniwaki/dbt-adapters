@@ -371,8 +371,9 @@ class SparkConnectSubmitter:
 
     def _get_or_create_spark(self, session_id: str) -> ConnectSparkSession:
         """pyspark 3.5's ``SparkSession.stop()`` does not release the server-side session
-        (``ReleaseSession`` is Spark 4 only), so one client is shared per Athena session
-        instead of one per model.
+        (``ReleaseSession`` is Spark 4 only), and Athena rejects new Spark Connect sessions
+        once too many pile up, so one client is shared per Athena session instead of one per
+        model. Models on the same Athena session therefore share temp views and session conf.
         """
         spark = self._pool.get_spark(session_id)
         if spark is not None:

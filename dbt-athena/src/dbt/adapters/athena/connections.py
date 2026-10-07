@@ -896,6 +896,7 @@ class AthenaConnectionManager(SQLConnectionManager):
     def cleanup_all(self) -> None:
         from dbt_common.invocation import get_invocation_id
 
+        # Releases DPUs now instead of after the session idle timeout.
         # Scope to this invocation; the singleton is shared across invocations
         # in dbt Cloud workers and test harnesses.
         try:

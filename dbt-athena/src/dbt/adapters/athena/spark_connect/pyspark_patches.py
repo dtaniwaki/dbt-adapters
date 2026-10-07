@@ -50,8 +50,8 @@ def _neutralize_release_thread_pool_shutdown() -> None:
 
 
 def _silence_release_all_warning() -> None:
-    """pyspark's ``_release_all`` is a fire-and-forget RPC that warns when the channel is already
-    closed; the server copes with abandoned executions, so the warning carries no information.
+    """pyspark's ``_release_all`` is a fire-and-forget RPC that warns on any ReleaseExecute
+    failure; the server copes with abandoned executions, so the warning carries no information.
     """
     import warnings
 
