@@ -114,7 +114,7 @@ if df is None:
     from botocore.exceptions import ClientError
 
     {%- set assume_role_arn = target.assume_role_arn or "" %}
-    {%- if assume_role_arn %}
+    {%- if assume_role_arn and not adapter.is_spark_connect_engine(spark_engine_version) %}
     _sts_creds = boto3.client("sts", region_name="{{ target.region_name }}").assume_role(
         RoleArn="{{ assume_role_arn }}",
         RoleSessionName="{{ target.assume_role_session_name or 'dbt-athena-skip-materialize-check' }}",

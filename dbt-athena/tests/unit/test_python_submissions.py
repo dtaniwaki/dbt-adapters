@@ -212,8 +212,9 @@ class TestAthenaPythonJobHelper:
         athena_spark_session_manager,
         athena_client,
     ):
+        session_id = uuid.uuid4()
         with patch.multiple(
-            athena_spark_session_manager, get_session_id=Mock(return_value=uuid.uuid4())
+            athena_spark_session_manager, get_session_id=Mock(return_value=session_id)
         ):
             with patch.multiple(
                 athena_client,
@@ -224,7 +225,9 @@ class TestAthenaPythonJobHelper:
                     athena_job_helper, poll_until_session_idle=Mock(return_value="IDLE")
                 ):
                     result = athena_job_helper.submit("hello world")
-                    assert result == test_calculation_execution["Result"]
+                    expected = dict(test_calculation_execution["Result"])
+                    expected["SparkSessionId"] = str(session_id)
+                    assert result == expected
 
 
 class TestSessionStateErrorHandling:

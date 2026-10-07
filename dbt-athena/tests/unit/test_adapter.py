@@ -16,11 +16,10 @@ from moto import mock_aws
 from moto.core import DEFAULT_ACCOUNT_ID
 from mypy_boto3_glue.client import GlueClient
 
-from pyathena.error import OperationalError
-
 from dbt.adapters.athena import AthenaAdapter
 from dbt.adapters.athena import Plugin as AthenaPlugin
 from dbt.adapters.athena.column import AthenaColumn
+from dbt.adapters.athena.connections import AthenaError
 from dbt.adapters.athena.exceptions import S3LocationException
 from dbt.adapters.athena.relation import AthenaRelation, TableType
 from dbt.adapters.athena.utils import AthenaCatalogType
@@ -1746,7 +1745,7 @@ class TestRunQueryWithPartitionsLimitCatching:
         with mock.patch.object(
             self.adapter,
             "_run_query",
-            side_effect=OperationalError("TOO_MANY_OPEN_PARTITIONS"),
+            side_effect=AthenaError("TOO_MANY_OPEN_PARTITIONS"),
         ):
             result = self.adapter.run_query_with_partitions_limit_catching(
                 "SELECT 1", disable_batch_fallback=False
@@ -1757,9 +1756,9 @@ class TestRunQueryWithPartitionsLimitCatching:
         with mock.patch.object(
             self.adapter,
             "_run_query",
-            side_effect=OperationalError("TOO_MANY_OPEN_PARTITIONS"),
+            side_effect=AthenaError("TOO_MANY_OPEN_PARTITIONS"),
         ):
-            with pytest.raises(OperationalError, match="TOO_MANY_OPEN_PARTITIONS"):
+            with pytest.raises(AthenaError, match="TOO_MANY_OPEN_PARTITIONS"):
                 self.adapter.run_query_with_partitions_limit_catching(
                     "SELECT 1", disable_batch_fallback=True
                 )
@@ -1768,9 +1767,9 @@ class TestRunQueryWithPartitionsLimitCatching:
         with mock.patch.object(
             self.adapter,
             "_run_query",
-            side_effect=OperationalError("SOME_OTHER_ERROR"),
+            side_effect=AthenaError("SOME_OTHER_ERROR"),
         ):
-            with pytest.raises(OperationalError, match="SOME_OTHER_ERROR"):
+            with pytest.raises(AthenaError, match="SOME_OTHER_ERROR"):
                 self.adapter.run_query_with_partitions_limit_catching(
                     "SELECT 1", disable_batch_fallback=False
                 )
