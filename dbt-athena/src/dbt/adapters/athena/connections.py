@@ -46,7 +46,11 @@ from tenacity import (
 )
 
 from dbt.adapters.athena.config import get_boto3_config
-from dbt.adapters.athena.constants import LOGGER, SPARK_CONNECT_RETRY_CATEGORIES
+from dbt.adapters.athena.constants import (
+    LOGGER,
+    SESSION_IDLE_TIMEOUT_MIN,
+    SPARK_CONNECT_RETRY_CATEGORIES,
+)
 from dbt.adapters.athena.exceptions import (
     AthenaError,
     AthenaQueryCancelledError,
@@ -118,6 +122,7 @@ class AthenaCredentials(Credentials):
     spark_connect_pool_acquire_timeout: Optional[int] = None
     spark_connect_max_retries: Optional[int] = None
     spark_connect_retry_on: Optional[List[str]] = None
+    spark_connect_keepalive_interval: Optional[int] = None
     s3_tmp_table_dir: Optional[str] = None
     # Unfortunately we can not just use dict, must be Dict because we'll get the following error:
     # Credentials in profile "athena", target "athena" invalid: Unable to create schema for 'dict'
@@ -136,6 +141,7 @@ class AthenaCredentials(Credentials):
             ("spark_connect_dpu_budget", 1),
             ("spark_connect_pool_acquire_timeout", 1),
             ("spark_connect_max_retries", 0),
+            ("spark_connect_keepalive_interval", 0),
         ):
             raw = getattr(self, field_name)
             if raw is None:
@@ -156,6 +162,14 @@ class AthenaCredentials(Credentials):
             raise DbtRuntimeError(
                 f"spark_connect_retry_on must be a list of {list(SPARK_CONNECT_RETRY_CATEGORIES)} "
                 f"(got {retry_on!r}). Omit the field to retry all of them."
+            )
+
+        idle_timeout_seconds = SESSION_IDLE_TIMEOUT_MIN * 60
+        keepalive_interval = self.spark_connect_keepalive_interval
+        if keepalive_interval is not None and keepalive_interval >= idle_timeout_seconds:
+            raise DbtRuntimeError(
+                f"spark_connect_keepalive_interval must be shorter than the Spark session "
+                f"idle timeout ({idle_timeout_seconds}s), got {keepalive_interval}."
             )
 
     @property
@@ -206,6 +220,7 @@ class AthenaCredentials(Credentials):
             "seed_s3_upload_args",
             "skip_workgroup_check",
             "spark_connect_dpu_budget",
+            "spark_connect_keepalive_interval",
             "spark_connect_max_retries",
             "spark_connect_max_sessions",
             "spark_connect_pool_acquire_timeout",

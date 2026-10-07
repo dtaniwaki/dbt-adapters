@@ -43,6 +43,7 @@ from dbt.adapters.athena.config import AthenaSparkSessionConfig
 from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.constants import (
     DEFAULT_SPARK_CONNECT_DPU_BUDGET,
+    DEFAULT_SPARK_CONNECT_KEEPALIVE_INTERVAL,
     DEFAULT_SPARK_CONNECT_MAX_RETRIES,
     DEFAULT_SPARK_CONNECT_MAX_SESSIONS,
     DEFAULT_SPARK_CONNECT_POOL_ACQUIRE_TIMEOUT,
@@ -59,6 +60,7 @@ from dbt.adapters.athena.spark_connect.errors import (
     is_grpc_permission_denied,
     is_session_ended_error,
 )
+from dbt.adapters.athena.spark_connect.keepalive import SessionKeepalive
 from dbt.adapters.athena.spark_connect.session import SparkConnectSessionPool
 
 if TYPE_CHECKING:
@@ -196,6 +198,13 @@ class SparkConnectSubmitter:
         if value is None:
             return frozenset(SPARK_CONNECT_RETRY_CATEGORIES)
         return frozenset(value)
+
+    @cached_property
+    def _keepalive_interval(self) -> int:
+        value = self.credentials.spark_connect_keepalive_interval
+        if value is None:
+            return DEFAULT_SPARK_CONNECT_KEEPALIVE_INTERVAL
+        return value
 
     @cached_property
     def _dpu_request(self) -> int:
@@ -449,6 +458,7 @@ class SparkConnectSubmitter:
         # can cancel only this model's operations on the shared client.
         model_tag = f"dbt-model-{uuid.uuid4().hex}"
         tagged = False
+        keepalive: Optional[SessionKeepalive] = None
 
         def _elapsed() -> float:
             return time.monotonic() - attempt_start
@@ -473,6 +483,9 @@ class SparkConnectSubmitter:
 
             spark.addTag(model_tag)
             tagged = True
+            if self._keepalive_interval > 0:
+                keepalive = SessionKeepalive(spark, session_id, self._keepalive_interval)
+                keepalive.start()
             timer = threading.Timer(exec_remaining, _on_timeout)
             timer.start()
 
@@ -528,6 +541,8 @@ class SparkConnectSubmitter:
                 category=category,
             )
         finally:
+            if keepalive is not None:
+                keepalive.stop()
             # Cancel the watchdog timer first and wait for any already-fired
             # callback to finish, so interruptTag() cannot race with the
             # tag removal below.
