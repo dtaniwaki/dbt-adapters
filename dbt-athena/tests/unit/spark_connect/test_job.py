@@ -564,8 +564,8 @@ class TestSparkConnectSubmission:
         "retry_on, message, retried",
         [
             (["session_ended"], "Session not active", True),
-            (["session_ended"], "Maximum allowed sessions", False),
-            (["capacity"], "Maximum allowed sessions", True),
+            (["session_ended"], "RESOURCE_EXHAUSTED", False),
+            (["capacity"], "RESOURCE_EXHAUSTED", True),
             (["capacity"], "Unable to load credentials", False),
             (["executor_environment"], "Unable to load credentials", True),
             (["executor_environment"], "Pool not running", False),
@@ -585,8 +585,17 @@ class TestSparkConnectSubmission:
         self._stub_endpoint_and_channel(submitter, monkeypatch)
         monkeypatch.setattr(time, "sleep", lambda *_: None)
 
+        class _FakeCode:
+            name = "RESOURCE_EXHAUSTED"
+
+        class _FakeRpcError(Exception):
+            def code(self):
+                return _FakeCode()
+
         first_spark = MagicMock()
-        first_spark.run.side_effect = Exception(message)
+        first_spark.run.side_effect = (
+            _FakeRpcError(message) if message == "RESOURCE_EXHAUSTED" else Exception(message)
+        )
         self._set_spark_create(side_effect=[first_spark, MagicMock()])
 
         if retried:

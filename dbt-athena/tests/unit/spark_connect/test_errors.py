@@ -142,7 +142,7 @@ def test_permission_denied_false_for_non_grpc_error():
             Exception("Can not generate Session endpoint URL for Session in STOPPED state"),
             "session_ended",
         ),
-        (Exception("Maximum allowed sessions reached"), "capacity"),
+        (Exception("Maximum allowed sessions reached"), None),
         (_FakeGrpcError("quota", "RESOURCE_EXHAUSTED"), "capacity"),
         (Exception("Unable to load credentials from any provider"), "executor_environment"),
         (Exception("Unable to load region"), "executor_environment"),
