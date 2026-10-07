@@ -84,3 +84,11 @@ class TestSparkConnectKeepaliveIntervalValidation:
             match="spark_connect_keepalive_interval must be a non-negative integer",
         ):
             _make(spark_connect_keepalive_interval=-1)
+
+    @pytest.mark.parametrize("value", [600, 900])
+    def test_interval_not_shorter_than_idle_timeout_is_rejected(self, value):
+        with pytest.raises(DbtRuntimeError, match="shorter than the Spark session idle timeout"):
+            _make(spark_connect_keepalive_interval=value)
+
+    def test_interval_just_below_idle_timeout_is_accepted(self):
+        assert _make(spark_connect_keepalive_interval=599).spark_connect_keepalive_interval == 599

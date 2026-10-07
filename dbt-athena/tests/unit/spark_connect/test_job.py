@@ -338,7 +338,13 @@ class TestSparkConnectSubmission:
         fake_spark = MagicMock()
         self._set_spark_create(return_value=fake_spark)
 
-        submitter.submit("import time\ntime.sleep(0.2)")
+        submitter.submit(
+            "import time\n"
+            "for _ in range(50):\n"
+            "    if spark.sql.call_count:\n"
+            "        break\n"
+            "    time.sleep(0.01)\n"
+        )
 
         keepalive_calls = fake_spark.sql.call_count
         assert (keepalive_calls > 0) is expect_keepalive

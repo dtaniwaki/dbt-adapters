@@ -46,7 +46,7 @@ from tenacity import (
 )
 
 from dbt.adapters.athena.config import get_boto3_config
-from dbt.adapters.athena.constants import LOGGER
+from dbt.adapters.athena.constants import LOGGER, SESSION_IDLE_TIMEOUT_MIN
 from dbt.adapters.athena.exceptions import (
     AthenaError,
     AthenaQueryCancelledError,
@@ -148,6 +148,14 @@ class AthenaCredentials(Credentials):
                     "Omit the field to use the default."
                 )
             setattr(self, field_name, int(raw))
+
+        idle_timeout_seconds = SESSION_IDLE_TIMEOUT_MIN * 60
+        keepalive_interval = self.spark_connect_keepalive_interval
+        if keepalive_interval is not None and keepalive_interval >= idle_timeout_seconds:
+            raise DbtRuntimeError(
+                f"spark_connect_keepalive_interval must be shorter than the Spark session "
+                f"idle timeout ({idle_timeout_seconds}s), got {keepalive_interval}."
+            )
 
     @property
     def type(self) -> str:
