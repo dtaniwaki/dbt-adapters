@@ -452,25 +452,27 @@ class SparkConnectSubmitter:
                     f"Spark Connect execution timed out after {self.timeout} seconds."
                 ) from e
 
-            # 403 with a dead session means Athena ended the session itself,
-            # so a fresh session cannot resume the work.
-            if is_grpc_permission_denied(e) and not self._pool.is_session_alive(
-                self.athena_client, session_id
+            transient = self._is_transient_failure(e)
+            terminate_session = transient
+            total_attempts = self._max_retries + 1
+            is_last_attempt = attempt >= total_attempts
+
+            # 403 with a dead session means Athena ended the session itself.
+            if (
+                is_last_attempt
+                and is_grpc_permission_denied(e)
+                and not self._pool.is_session_alive(self.athena_client, session_id)
             ):
                 LOGGER.error(
                     f"Model {self.relation_name} (session {session_id}) - "
-                    f"Athena terminated the Spark session\n{traceback.format_exc()}"
+                    f"Athena terminated the Spark session "
+                    f"(attempt {attempt}/{total_attempts})\n{traceback.format_exc()}"
                 )
                 raise SparkSessionTerminatedError(
                     f"Athena terminated Spark session {session_id}; "
                     f"check session state and workgroup DPU/quota. "
                     f"Underlying error: {type(e).__name__}: {e}"
                 ) from e
-
-            transient = self._is_transient_failure(e)
-            terminate_session = transient
-            total_attempts = self._max_retries + 1
-            is_last_attempt = attempt >= total_attempts
 
             if not transient or is_last_attempt:
                 LOGGER.error(

@@ -13,6 +13,9 @@ TRANSIENT_SPARK_PATTERNS = [
     "Pool not running",
     # Athena terminated the Spark session (idle timeout / DPU / quota).
     "Session not active",
+    "NO_ACTIVE_SESSION",
+    # GetSessionEndpoint during auth-token refresh after Athena stopped the session.
+    "in STOPPED state",
     # Account/workgroup session quota exhausted; retry after others finish.
     "Maximum allowed sessions",
 ]
