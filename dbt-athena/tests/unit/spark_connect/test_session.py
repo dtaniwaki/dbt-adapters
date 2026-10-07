@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import MagicMock
 
 import pytest
@@ -1092,6 +1092,17 @@ class TestStartSessionPushback:
             {"SessionId": session_id, "State": "IDLE"}
         ]
         return client
+
+    def test_every_pushback_category_has_a_warning(self):
+        assert set(session_module._PUSHBACK_WARNINGS) == set(
+            get_args(session_module.PushbackCategory)
+        )
+
+    def test_unknown_category_has_no_warning(self):
+        req = MagicMock(key=self.KEY, dpu_request=4, dpu_budget=160)
+
+        with pytest.raises(KeyError):
+            SparkConnectSessionPool._pushback_warning(req, "bogus", 0)
 
     @pytest.mark.parametrize("error, expected", CASES)
     def test_each_category_emits_its_own_warning_text(self, monkeypatch, error, expected):

@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, TypedDict
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
 
 from dbt_common.exceptions import DbtRuntimeError
 from mypy_boto3_athena.client import AthenaClient
@@ -20,31 +20,53 @@ if TYPE_CHECKING:
 SessionKey = Tuple[str, str]
 
 
-class _SessionInfo(TypedDict, total=False):
+class _RequiredSessionInfo(TypedDict):
     key: SessionKey
     client: AthenaClient
     load: int
     dpu: int
     draining: bool
     idle_since: Optional[float]
+
+
+class _SessionInfo(_RequiredSessionInfo, total=False):
     # Spark Connect client bound to this Athena session, shared by every
     # model that attaches to it. ``None`` until the first model creates it.
     spark: Optional[ConnectSparkSession]
 
 
-_SESSION_LIMIT = "session_limit"
-_CAPACITY = "capacity"
-_THROTTLING = "throttling"
+PushbackCategory = Literal["session_limit", "capacity", "throttling"]
+
+_SESSION_LIMIT: PushbackCategory = "session_limit"
+_CAPACITY: PushbackCategory = "capacity"
+_THROTTLING: PushbackCategory = "throttling"
 
 # Checked in order; the first category with a matching substring wins.
-_PUSHBACK_PATTERNS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+_PUSHBACK_PATTERNS: Tuple[Tuple[PushbackCategory, Tuple[str, ...]], ...] = (
     (_SESSION_LIMIT, ("Maximum allowed sessions",)),
     (_CAPACITY, ("required capacity not being available",)),
     (_THROTTLING, ("ThrottlingException", "Rate exceeded")),
 )
 
 
-def _classify_pushback(message: str) -> Optional[str]:
+_PUSHBACK_WARNINGS: Dict[PushbackCategory, str] = {
+    _SESSION_LIMIT: (
+        "Athena rejected StartSession (account session limit) for key {key}; "
+        "client-side accounting saw used={used} + request={request} "
+        "<= budget={budget}. Another process may share the account quota."
+    ),
+    _CAPACITY: (
+        "Athena rejected StartSession for key {key}: AWS region capacity "
+        "unavailable. Backing off; this is transient and budget cannot predict it."
+    ),
+    _THROTTLING: (
+        "Athena throttled StartSession (Rate exceeded) for key {key}; "
+        "backing off. Lower dbt threads or spark_connect_max_sessions if persistent."
+    ),
+}
+
+
+def _classify_pushback(message: str) -> Optional[PushbackCategory]:
     for category, patterns in _PUSHBACK_PATTERNS:
         if any(pattern in message for pattern in patterns):
             return category
@@ -60,7 +82,7 @@ class _StartSessionPushback(Exception):
     pool backs off and retries rather than failing the model.
     """
 
-    def __init__(self, category: str) -> None:
+    def __init__(self, category: PushbackCategory) -> None:
         super().__init__(category)
         self.category = category
 
@@ -87,20 +109,27 @@ class _Decision:
     stale_entries: List[Tuple[str, _SessionInfo]] = field(default_factory=list)
     reuse_candidate: Optional[str] = None
     new_session_id: Optional[str] = None
-    pushback: Optional[str] = None
+    pushback: Optional[PushbackCategory] = None
     start_error: Optional[BaseException] = None
     budget_used: int = 0
     reclaimed_any: bool = False
 
 
-@dataclass
-class _Attempt:
-    """Outcome of one acquire attempt: a session, an immediate retry, or a wait."""
+class _Retry:
+    """Marker: try again immediately, without sleeping."""
 
-    session_id: Optional[str] = None
-    retry: bool = False
-    pushback: Optional[str] = None
-    budget_used: int = 0
+
+_RETRY = _Retry()
+
+
+@dataclass(frozen=True)
+class _Wait:
+    pushback: Optional[PushbackCategory]
+    budget_used: int
+
+
+# A session id, an immediate retry, or a wait before the next attempt.
+_Attempt = Union[str, _Retry, _Wait]
 
 
 class SparkConnectSessionPool:
@@ -193,9 +222,9 @@ class SparkConnectSessionPool:
 
         while True:
             attempt = self._try_once(req, skip)
-            if attempt.session_id is not None:
-                return attempt.session_id
-            if attempt.retry:
+            if isinstance(attempt, str):
+                return attempt
+            if isinstance(attempt, _Retry):
                 continue
 
             # Periodically evict dead sessions so stuck slots don't block.
@@ -234,7 +263,7 @@ class SparkConnectSessionPool:
             raise decision.start_error
         # Athena counts a session against its limits until TerminateSession returns.
         if decision.reclaimed_any:
-            return _Attempt(retry=True)
+            return _RETRY
 
         if decision.pushback is not None:
             LOGGER.warning(self._pushback_warning(req, decision.pushback, decision.budget_used))
@@ -242,13 +271,13 @@ class SparkConnectSessionPool:
         candidate = decision.reuse_candidate
         if candidate is not None:
             if self._confirm_reuse(req.key, candidate, skip):
-                return _Attempt(session_id=candidate)
-            return _Attempt(retry=True)
+                return candidate
+            return _RETRY
 
         if decision.new_session_id is not None:
-            return _Attempt(session_id=decision.new_session_id)
+            return decision.new_session_id
 
-        return _Attempt(pushback=decision.pushback, budget_used=decision.budget_used)
+        return _Wait(pushback=decision.pushback, budget_used=decision.budget_used)
 
     def _decide(self, req: _AcquireRequest, skip: Set[str]) -> _Decision:
         """Pick this attempt's action under ``self._lock``: attach, reclaim, or start."""
@@ -286,22 +315,14 @@ class SparkConnectSessionPool:
         return decision
 
     @staticmethod
-    def _pushback_warning(req: _AcquireRequest, category: str, budget_used: int) -> str:
-        key = req.key
-        if category == _SESSION_LIMIT:
-            return (
-                f"Athena rejected StartSession (account session limit) for key {key}; "
-                f"client-side accounting saw used={budget_used} + request={req.dpu_request} "
-                f"<= budget={req.dpu_budget}. Another process may share the account quota."
-            )
-        if category == _CAPACITY:
-            return (
-                f"Athena rejected StartSession for key {key}: AWS region capacity "
-                f"unavailable. Backing off; this is transient and budget cannot predict it."
-            )
-        return (
-            f"Athena throttled StartSession (Rate exceeded) for key {key}; "
-            f"backing off. Lower dbt threads or spark_connect_max_sessions if persistent."
+    def _pushback_warning(
+        req: _AcquireRequest, category: PushbackCategory, budget_used: int
+    ) -> str:
+        return _PUSHBACK_WARNINGS[category].format(
+            key=req.key,
+            used=budget_used,
+            request=req.dpu_request,
+            budget=req.dpu_budget,
         )
 
     def _confirm_reuse(self, key: SessionKey, candidate: str, skip: Set[str]) -> bool:

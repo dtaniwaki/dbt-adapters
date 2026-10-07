@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Literal, Tuple
 
 from dbt.adapters.events.logging import AdapterLogger
 
@@ -12,7 +13,10 @@ DEFAULT_SPARK_CONNECT_DPU_BUDGET = 60
 # Safety net only; firing this means DPU exhaustion or a stuck pool.
 DEFAULT_SPARK_CONNECT_POOL_ACQUIRE_TIMEOUT = 21600  # 6h
 DEFAULT_SPARK_CONNECT_MAX_RETRIES = 3
-SPARK_CONNECT_RETRY_CATEGORIES = (
+SparkConnectRetryCategory = Literal[
+    "session_ended", "capacity", "executor_environment", "connection"
+]
+SPARK_CONNECT_RETRY_CATEGORIES: Tuple[SparkConnectRetryCategory, ...] = (
     "session_ended",
     "capacity",
     "executor_environment",

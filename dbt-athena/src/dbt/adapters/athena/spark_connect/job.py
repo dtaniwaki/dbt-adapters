@@ -40,6 +40,7 @@ from dbt.adapters.athena.config import AthenaSparkSessionConfig
 from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.constants import (
     LOGGER,
+    SparkConnectRetryCategory,
 )
 from dbt.adapters.athena.exceptions import SparkSessionTerminatedError
 from dbt.adapters.athena.session import get_boto3_session_from_credentials
@@ -101,7 +102,7 @@ class _TransientAttemptFailure(Exception):
         session_id: str,
         session_ended: bool,
         retryable: bool,
-        category: str,
+        category: SparkConnectRetryCategory,
     ) -> None:
         super().__init__(str(error))
         self.error = error
