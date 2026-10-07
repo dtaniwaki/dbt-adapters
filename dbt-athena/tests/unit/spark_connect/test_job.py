@@ -1148,13 +1148,13 @@ class TestExecutionGuard:
 
     def _guard(self, spark, *, budget=60.0, keepalive_interval=300, event=None):
         return _ExecutionGuard(
-            spark,
-            "sid-1",
-            "rel",
-            budget,
-            budget,
-            keepalive_interval,
-            event or threading.Event(),
+            spark=spark,
+            session_id="sid-1",
+            relation_name="rel",
+            timeout=budget,
+            budget=budget,
+            keepalive_interval=keepalive_interval,
+            timeout_event=event or threading.Event(),
         )
 
     def test_tags_during_body_and_cleans_up_after(self, keepalive_cls):

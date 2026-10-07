@@ -117,6 +117,7 @@ class _ExecutionGuard:
 
     def __init__(
         self,
+        *,
         spark: ConnectSparkSession,
         session_id: str,
         relation_name: Optional[str],
@@ -210,6 +211,10 @@ class SparkConnectSubmitter:
         self._pool = SparkConnectSessionPool()
 
     @property
+    def _total_attempts(self) -> int:
+        return self.credentials.effective_spark_connect_max_retries + 1
+
+    @property
     def _session_fingerprint(self) -> str:
         """md5 of engine config + workgroup + engine version.
 
@@ -267,7 +272,7 @@ class SparkConnectSubmitter:
         self._install_assumed_default_session()
 
         pool_start = time.monotonic()
-        total_attempts = self.credentials.effective_spark_connect_max_retries + 1
+        total_attempts = self._total_attempts
         attempt = 0
 
         while True:
@@ -477,13 +482,13 @@ class SparkConnectSubmitter:
                 )
 
             guard = _ExecutionGuard(
-                spark,
-                session_id,
-                self.relation_name,
-                self.timeout,
-                budget,
-                self.credentials.effective_spark_connect_keepalive_interval,
-                timeout_event,
+                spark=spark,
+                session_id=session_id,
+                relation_name=self.relation_name,
+                timeout=self.timeout,
+                budget=budget,
+                keepalive_interval=self.credentials.effective_spark_connect_keepalive_interval,
+                timeout_event=timeout_event,
             )
             with guard:
                 exec_globals: Dict[str, Any] = {"spark": spark}
@@ -526,7 +531,7 @@ class SparkConnectSubmitter:
         self, e: Exception, session_id: str, attempt: int
     ) -> Union[DbtRuntimeError, _TransientAttemptFailure]:
         category = classify_transient_spark_error(e)
-        total_attempts = self.credentials.effective_spark_connect_max_retries + 1
+        total_attempts = self._total_attempts
         is_last_attempt = attempt >= total_attempts
 
         session_ended = (
