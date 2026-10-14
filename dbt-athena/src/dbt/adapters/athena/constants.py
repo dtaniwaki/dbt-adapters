@@ -62,15 +62,30 @@ DEFAULT_SPARK_PROPERTIES = {
 }
 
 # Modes of the ``spark_cross_account_catalog`` model config.
-#   none: no cross-account access (default)
-#   hive: Hive metastore Glue client with the ``/`` catalog separator
-#         (``<account_id>/<schema>.<table>``); equivalent to the legacy ``true``
+#   none:    no cross-account access (default)
+#   hive:    Hive metastore Glue client with the ``/`` catalog separator
+#            (``<account_id>/<schema>.<table>``); equivalent to the legacy ``true``
+#   iceberg: one named Iceberg GlueCatalog per registered cross-account catalog
+#            (``<catalog>.<schema>.<table>``); for Iceberg tables only
 SPARK_CROSS_ACCOUNT_CATALOG_NONE = "none"
 SPARK_CROSS_ACCOUNT_CATALOG_HIVE = "hive"
+SPARK_CROSS_ACCOUNT_CATALOG_ICEBERG = "iceberg"
 SPARK_CROSS_ACCOUNT_CATALOG_MODES: Tuple[str, ...] = (
     SPARK_CROSS_ACCOUNT_CATALOG_NONE,
     SPARK_CROSS_ACCOUNT_CATALOG_HIVE,
+    SPARK_CROSS_ACCOUNT_CATALOG_ICEBERG,
 )
+
+# Spark properties generated per catalog in the ``iceberg`` mode. ``{prefix}`` is
+# ``spark.sql.catalog.<catalog name>``. ``glue.id`` / ``glue.account-id`` and
+# ``client.region`` are added from the catalog registration and the profile.
+# https://docs.aws.amazon.com/athena/latest/ug/notebooks-spark-table-formats-apache-iceberg.html
+# https://iceberg.apache.org/docs/latest/aws/#glue-catalog
+ICEBERG_CROSS_ACCOUNT_CATALOG_PROPERTIES = {
+    "{prefix}": "org.apache.iceberg.spark.SparkCatalog",
+    "{prefix}.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+    "{prefix}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+}
 
 LOGGER = AdapterLogger(__name__)
 

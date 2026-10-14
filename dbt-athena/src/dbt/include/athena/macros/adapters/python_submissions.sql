@@ -165,13 +165,16 @@ execute_query(spark)
   dbt.source() / dbt.ref() without hard-coding account IDs.
 
   The mapping is injected as a Python dict only when the model has
-  `spark_cross_account_catalog: hive` (or the legacy `true`). That config causes
-  `AthenaSparkSessionConfig` to set `spark.hadoop.aws.glue.catalog.separator`
-  to `/` on the Spark session, which is the only form Spark can parse for
-  `<account_id>/<schema>.<table>` identifiers. Populating the map without
-  enabling the config would emit identifiers the Spark parser rejects, so
-  models that do not opt in receive an empty mapping and fall back to the
-  legacy `<schema>.<table>` form (local catalog behavior, unchanged).
+  `spark_cross_account_catalog: hive` (or the legacy `true`) or `iceberg`.
+  - `hive`: `AthenaSparkSessionConfig` sets `spark.hadoop.aws.glue.catalog.separator`
+    to `/` on the Spark session, which is the only form Spark can parse for
+    `<account_id>/<schema>.<table>` identifiers.
+  - `iceberg`: `AthenaSparkSessionConfig` registers one named Iceberg GlueCatalog
+    per cross-account catalog, addressed as `<catalog>.<schema>.<table>`.
+  Populating the map without enabling the config would emit identifiers the
+  Spark session cannot resolve, so models that do not opt in receive an empty
+  mapping and fall back to the legacy `<schema>.<table>` form (local catalog
+  behavior, unchanged).
 -#}
 {%- set cross_account_mode = config.get("spark_cross_account_catalog", none) -%}
 {%- if cross_account_mode is sameas true -%}
@@ -180,11 +183,13 @@ execute_query(spark)
   {%- set cross_account_mode = cross_account_mode | trim | lower -%}
   {%- if cross_account_mode == "true" -%}{%- set cross_account_mode = "hive" -%}{%- endif -%}
 {%- endif -%}
-{%- if cross_account_mode == "hive" -%}
+{%- if cross_account_mode in ("hive", "iceberg") -%}
   {%- set cross_account_catalogs = adapter.get_spark_cross_account_catalog_map() -%}
 {%- else -%}
+  {%- set cross_account_mode = "none" -%}
   {%- set cross_account_catalogs = {} -%}
 {%- endif -%}
+_CROSS_ACCOUNT_CATALOG_MODE = {{ cross_account_mode | tojson }}
 _CROSS_ACCOUNT_CATALOGS = {{ cross_account_catalogs | tojson }}
 
 def get_spark_df(identifier):
@@ -202,19 +207,20 @@ def get_spark_df(identifier):
     For local catalog (`awsdatacatalog`) references we therefore strip the
     catalog component and call spark.table('schema.table').
 
-    For cross-account GLUE catalogs registered in Athena, we translate the
-    catalog name to the corresponding AWS account ID (resolved at compile
-    time by the adapter) and emit '`account_id/schema`.table' — which
-    Spark's Glue Catalog Client can resolve when the
-    `spark.hadoop.aws.glue.catalog.separator` property is set to '/'. That
-    property is set automatically by `AthenaSparkSessionConfig` when the
-    model opts in with `spark_cross_account_catalog: hive`; when the model
-    does not opt in, `_CROSS_ACCOUNT_CATALOGS` is empty and we fall back to
-    the legacy two-part form.
+    For cross-account GLUE catalogs registered in Athena, the form depends on
+    `spark_cross_account_catalog` (both resolved at compile time by the adapter):
+    - `hive`: translate the catalog name to the corresponding AWS account ID and
+      emit '`account_id/schema`.table', which Spark's Glue Catalog Client can
+      resolve when `spark.hadoop.aws.glue.catalog.separator` is set to '/'.
+    - `iceberg`: emit '`catalog`.schema.table', which resolves to the named
+      Iceberg GlueCatalog registered for that catalog on the Spark session.
+    Both properties are set automatically by `AthenaSparkSessionConfig`; when
+    the model does not opt in, `_CROSS_ACCOUNT_CATALOGS` is empty and we fall
+    back to the legacy two-part form.
 
-    The backtick quoting around `account_id/schema` is required because
-    `spark.table()` internally parses the name as a SQL identifier, and `/`
-    is not valid in an unquoted identifier.
+    The backtick quoting is required because `spark.table()` internally parses
+    the name as a SQL identifier, and `/` or `-` (allowed in Athena catalog
+    names) is not valid in an unquoted identifier.
     """
     parts = identifier.replace('"', '').split(".")
     if len(parts) < 3:
@@ -225,6 +231,8 @@ def get_spark_df(identifier):
     account_id = _CROSS_ACCOUNT_CATALOGS.get(catalog)
     if account_id is None:
         return spark.table(f"{schema}.{table}")
+    if _CROSS_ACCOUNT_CATALOG_MODE == "iceberg":
+        return spark.table(f"`{catalog}`.{schema}.{table}")
     return spark.table(f"`{account_id}/{schema}`.{table}")
 
 class SparkdbtObj(dbtObj):

@@ -5,11 +5,19 @@ from typing import Any, Dict
 import botocore
 from dbt_common.exceptions import DbtRuntimeError
 
-from dbt.adapters.athena.config import AthenaSparkSessionConfig
+from dbt.adapters.athena.config import (
+    AthenaSparkSessionConfig,
+    get_boto3_config,
+    get_spark_cross_account_catalog_mode,
+)
 from dbt.adapters.athena.connections import AthenaCredentials
-from dbt.adapters.athena.constants import LOGGER
-from dbt.adapters.athena.session import AthenaSparkSessionManager
+from dbt.adapters.athena.constants import LOGGER, SPARK_CROSS_ACCOUNT_CATALOG_ICEBERG
+from dbt.adapters.athena.session import (
+    AthenaSparkSessionManager,
+    get_boto3_session_from_credentials,
+)
 from dbt.adapters.athena.spark_connect.job import SparkConnectSubmitter
+from dbt.adapters.athena.utils import list_spark_cross_account_catalogs
 from dbt.adapters.base import PythonJobHelper
 
 SUBMISSION_LANGUAGE = "python"
@@ -33,8 +41,11 @@ class AthenaPythonJobHelper(PythonJobHelper):
         """
         self.relation_name = parsed_model.get("relation_name", None)
         self.credentials = credentials
+        model_config = parsed_model.get("config", {})
         self.config = AthenaSparkSessionConfig(
-            parsed_model.get("config", {}),
+            model_config,
+            cross_account_catalogs=self._get_cross_account_catalogs(model_config),
+            region_name=credentials.region_name,
             polling_interval=credentials.poll_interval,
             retry_attempts=credentials.num_retries,
         )
@@ -45,6 +56,26 @@ class AthenaPythonJobHelper(PythonJobHelper):
             self.engine_config,
             self.relation_name,
         )
+
+    def _get_cross_account_catalogs(self, model_config: Dict[str, Any]) -> Dict[str, str]:
+        """Look up the registered cross-account GLUE catalogs for the ``iceberg`` mode.
+
+        The Spark session configuration is derived from the model config alone, so the
+        lookup happens here, where the profile credentials are available. Other modes
+        do not need it and skip the API calls.
+        """
+        mode = get_spark_cross_account_catalog_mode(
+            model_config.get("spark_cross_account_catalog")
+        )
+        if mode != SPARK_CROSS_ACCOUNT_CATALOG_ICEBERG:
+            return {}
+        session = get_boto3_session_from_credentials(self.credentials)
+        athena = session.client(
+            "athena",
+            region_name=self.credentials.region_name,
+            config=get_boto3_config(num_retries=self.credentials.effective_num_retries),
+        )
+        return list_spark_cross_account_catalogs(athena)
 
     @cached_property
     def timeout(self) -> int:

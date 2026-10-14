@@ -93,6 +93,7 @@ from dbt.adapters.athena.utils import (
     get_catalog_type,
     get_chunks,
     is_valid_table_parameter_key,
+    list_spark_cross_account_catalogs,
     stringify_table_parameter_value,
 )
 from dbt.adapters.base import ConstraintSupport, PythonJobHelper, available
@@ -1031,19 +1032,13 @@ class AthenaAdapter(SQLAdapter):
 
         Used by the Python (Spark) submission macro to translate
         ``dbt.source()`` / ``dbt.ref()`` identifiers that reference
-        federated GLUE catalogs into the
-        ``<account_id>/<schema>.<table>`` form required by Spark's
-        Glue Catalog Client when ``spark_cross_account_catalog`` is ``hive``
-        (or the legacy ``true``).
+        federated GLUE catalogs when ``spark_cross_account_catalog`` is set:
+        ``<account_id>/<schema>.<table>`` in the ``hive`` mode and
+        ``<catalog>.<schema>.<table>`` in the ``iceberg`` mode.
 
-        The default catalog (``awsdatacatalog``) is excluded because it is
-        always local and does not require the account-id prefix. Non-GLUE
-        catalogs (LAMBDA/HIVE/etc.) are excluded because Spark's Glue Catalog
-        Client cannot read from them.
-
-        Requires ``athena:ListDataCatalogs`` and ``athena:GetDataCatalog``
-        permissions. The result is cached per adapter instance to avoid
-        repeated API calls.
+        See :func:`dbt.adapters.athena.utils.list_spark_cross_account_catalogs`
+        for what is included. The result is cached per adapter instance to
+        avoid repeated API calls.
         """
         conn = self.connections.get_thread_connection()
         creds = conn.credentials
@@ -1054,22 +1049,7 @@ class AthenaAdapter(SQLAdapter):
                 region_name=client.region_name,
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
-
-        result: Dict[str, str] = {}
-        paginator = athena.get_paginator("list_data_catalogs")
-        for page in paginator.paginate():
-            for summary in page.get("DataCatalogsSummary", []):
-                name = summary.get("CatalogName")
-                catalog_type = summary.get("Type")
-                if not name or name.lower() == "awsdatacatalog" or catalog_type != "GLUE":
-                    continue
-                data_catalog = athena.get_data_catalog(Name=name).get("DataCatalog")
-                if not data_catalog:
-                    continue
-                catalog_id = get_catalog_id(data_catalog)
-                if catalog_id:
-                    result[name] = catalog_id
-        return result
+        return list_spark_cross_account_catalogs(athena)
 
     @available
     def list_relations_without_caching(

@@ -1,6 +1,6 @@
 import importlib.metadata
 from functools import lru_cache
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 from botocore import config
 
@@ -11,9 +11,11 @@ from dbt.adapters.athena.constants import (
     DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
     DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
     DEFAULT_SPARK_PROPERTIES,
+    ICEBERG_CROSS_ACCOUNT_CATALOG_PROPERTIES,
     LOGGER,
     SPARK_CONNECT_ENGINE_VERSION,
     SPARK_CROSS_ACCOUNT_CATALOG_HIVE,
+    SPARK_CROSS_ACCOUNT_CATALOG_ICEBERG,
     SPARK_CROSS_ACCOUNT_CATALOG_MODES,
     SPARK_CROSS_ACCOUNT_CATALOG_NONE,
 )
@@ -26,8 +28,10 @@ def is_spark_connect_engine_version(value: Any) -> bool:
 def get_spark_cross_account_catalog_mode(value: Any) -> str:
     """Normalize the ``spark_cross_account_catalog`` model config to a mode name.
 
-    Booleans are accepted for backward compatibility: ``true`` maps to ``hive``
-    and ``false`` (or unset) maps to ``none``.
+    Modes: ``none`` (default), ``hive`` (Glue catalog separator) and ``iceberg``
+    (named Iceberg GlueCatalog per cross-account catalog). Booleans are accepted
+    for backward compatibility: ``true`` maps to ``hive`` and ``false`` (or unset)
+    maps to ``none``.
 
     Raises:
         ValueError: If the value is not a boolean or a known mode name.
@@ -50,6 +54,28 @@ def get_spark_cross_account_catalog_mode(value: Any) -> str:
     )
 
 
+def build_iceberg_cross_account_catalog_properties(
+    catalogs: Mapping[str, str], region_name: Optional[str]
+) -> Dict[str, str]:
+    """Build the Spark properties of the ``iceberg`` cross-account mode.
+
+    Registers one named Iceberg ``GlueCatalog`` per entry of ``catalogs``
+    (Athena Data Catalog name -> AWS account ID), so that Spark can read
+    Iceberg tables of that account as ``<catalog>.<schema>.<table>``.
+    ``glue.lakeformation-enabled`` is left unset (Iceberg default).
+    """
+    properties: Dict[str, str] = {}
+    for catalog_name, account_id in sorted(catalogs.items()):
+        prefix = f"spark.sql.catalog.{catalog_name}"
+        for key, value in ICEBERG_CROSS_ACCOUNT_CATALOG_PROPERTIES.items():
+            properties[key.format(prefix=prefix)] = value
+        properties[f"{prefix}.glue.id"] = account_id
+        properties[f"{prefix}.glue.account-id"] = account_id
+        if region_name:
+            properties[f"{prefix}.client.region"] = region_name
+    return properties
+
+
 @lru_cache()
 def get_boto3_config(num_retries: int) -> config.Config:
     return config.Config(
@@ -63,8 +89,25 @@ class AthenaSparkSessionConfig:
     A helper class to manage Athena Spark Session Configuration.
     """
 
-    def __init__(self, config: Dict[str, Any], **session_kwargs: Any) -> None:
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        cross_account_catalogs: Optional[Mapping[str, str]] = None,
+        region_name: Optional[str] = None,
+        **session_kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            config: The parsed model config.
+            cross_account_catalogs: Athena Data Catalog name -> AWS account ID of the
+                registered cross-account GLUE catalogs. Used by the ``iceberg`` mode of
+                ``spark_cross_account_catalog``.
+            region_name: Region of the Glue catalogs, set as ``client.region`` of the
+                named Iceberg catalogs in the ``iceberg`` mode.
+        """
         self.config = config
+        self.cross_account_catalogs = dict(cross_account_catalogs or {})
+        self.region_name = region_name
         self.session_kwargs = session_kwargs
 
     @property
@@ -168,6 +211,11 @@ class AthenaSparkSessionConfig:
                 else {}
             ),
             **(
+                self._iceberg_cross_account_catalog_properties()
+                if spark_cross_account_catalog == SPARK_CROSS_ACCOUNT_CATALOG_ICEBERG
+                else {}
+            ),
+            **(
                 DEFAULT_SPARK_PROPERTIES.get("spark_requester_pays", {})
                 if spark_requester_pays
                 else {}
@@ -212,6 +260,16 @@ class AthenaSparkSessionConfig:
             raise KeyError("The lowest value supported for MaxConcurrentDpus is 2")
         LOGGER.debug(f"Setting engine configuration: {engine_config}")
         return engine_config
+
+    def _iceberg_cross_account_catalog_properties(self) -> Dict[str, str]:
+        if not self.cross_account_catalogs:
+            LOGGER.warning(
+                "spark_cross_account_catalog is 'iceberg' but no cross-account GLUE "
+                "data catalog is registered in Athena; no named catalog is added"
+            )
+        return build_iceberg_cross_account_catalog_properties(
+            self.cross_account_catalogs, self.region_name
+        )
 
     @staticmethod
     def _build_calculations_engine_config(

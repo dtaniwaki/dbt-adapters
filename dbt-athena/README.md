@@ -735,14 +735,36 @@ The adapter supports Python models using [`spark`](https://docs.aws.amazon.com/a
     - If this flag is set to true, encrypts data in transit between Spark nodes and also encrypts data at rest stored
       locally by Spark.
 - `spark_cross_account_catalog` (`default=none`)
-    - One of `none` or `hive`. Booleans are still accepted for backward compatibility: `true` means `hive`
-      and `false` means `none`.
+    - One of `none`, `hive` or `iceberg`. Booleans are still accepted for backward compatibility: `true` means
+      `hive` and `false` means `none`.
     - When using the Spark Athena workgroup, queries can only be made against catalogs located on the same
       AWS account by default. However, sometimes you want to query another catalog located on an external AWS
-      account. Setting this parameter to `hive` enables querying external catalogs through the Hive metastore
-      Glue client (`spark.hadoop.aws.glue.catalog.separator=/`).
-      You can use the syntax `external_catalog_id/database.table` to access the external table on the external
-      catalog (ex: `999999999999/mydatabase.cloudfront_logs` where 999999999999 is the external catalog ID)
+      account. Both modes below resolve `dbt.source()` / `dbt.ref()` references to the cross-account GLUE
+      data catalogs registered in Athena, so the dependency shows up in the dbt DAG. They require
+      `athena:ListDataCatalogs` and `athena:GetDataCatalog` permissions.
+    - `hive` enables querying external catalogs through the Hive metastore Glue client
+      (`spark.hadoop.aws.glue.catalog.separator=/`). You can use the syntax `external_catalog_id/database.table`
+      to access the external table on the external catalog (ex: `999999999999/mydatabase.cloudfront_logs`
+      where 999999999999 is the external catalog ID). This client cannot read Iceberg tables
+      (`StorageDescriptor#InputFormat cannot be null`).
+    - `iceberg` registers one named Iceberg `GlueCatalog` per registered cross-account GLUE data catalog, using
+      the Athena data catalog name as the Spark catalog name. For a catalog `shared_catalog` with catalog ID
+      `123456789012` the following Spark properties are added
+      (`glue.lakeformation-enabled` is not set, so the Iceberg default applies):
+
+      ```text
+      spark.sql.catalog.shared_catalog=org.apache.iceberg.spark.SparkCatalog
+      spark.sql.catalog.shared_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+      spark.sql.catalog.shared_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+      spark.sql.catalog.shared_catalog.glue.id=123456789012
+      spark.sql.catalog.shared_catalog.glue.account-id=123456789012
+      spark.sql.catalog.shared_catalog.client.region=<region of the profile>
+      ```
+
+      You can use the syntax `shared_catalog.database.table` to access the external table. This mode is for
+      Iceberg tables only: non-Iceberg tables in the external catalog are not visible through the named catalog
+      (`TABLE_OR_VIEW_NOT_FOUND`). `spark_catalog` is left unchanged, so `dbt.this` and local tables keep
+      working as before. The generated properties take precedence over the same keys in `engine_config`.
 - `spark_requester_pays` (`default=false`)
     - When an Amazon S3 bucket is configured as requester pays, the account of the user running the query is charged for
       data access and data transfer fees associated with the query.

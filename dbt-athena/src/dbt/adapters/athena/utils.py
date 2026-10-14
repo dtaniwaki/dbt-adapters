@@ -1,7 +1,7 @@
 import json
 import re
 from enum import Enum
-from typing import Any, Generator, Iterable, List, Optional, TypeVar
+from typing import Any, Dict, Generator, Iterable, List, Optional, TypeVar
 
 from mypy_boto3_athena.type_defs import DataCatalogTypeDef
 
@@ -47,6 +47,32 @@ class AthenaCatalogType(Enum):
     GLUE = "GLUE"
     LAMBDA = "LAMBDA"
     HIVE = "HIVE"
+
+
+def list_spark_cross_account_catalogs(athena_client: Any) -> Dict[str, str]:
+    """Map every registered cross-account GLUE Data Catalog name to its AWS account ID.
+
+    The default catalog (``awsdatacatalog``) is excluded because it is always local.
+    Non-GLUE catalogs (LAMBDA/HIVE/etc.) are excluded because Spark cannot read them
+    through the Glue catalog clients.
+
+    Requires ``athena:ListDataCatalogs`` and ``athena:GetDataCatalog`` permissions.
+    """
+    result: Dict[str, str] = {}
+    paginator = athena_client.get_paginator("list_data_catalogs")
+    for page in paginator.paginate():
+        for summary in page.get("DataCatalogsSummary", []):
+            name = summary.get("CatalogName")
+            catalog_type = summary.get("Type")
+            if not name or name.lower() == "awsdatacatalog" or catalog_type != "GLUE":
+                continue
+            data_catalog = athena_client.get_data_catalog(Name=name).get("DataCatalog")
+            if not data_catalog:
+                continue
+            catalog_id = get_catalog_id(data_catalog)
+            if catalog_id:
+                result[name] = catalog_id
+    return result
 
 
 def get_catalog_type(catalog: Optional[DataCatalogTypeDef]) -> Optional[AthenaCatalogType]:
