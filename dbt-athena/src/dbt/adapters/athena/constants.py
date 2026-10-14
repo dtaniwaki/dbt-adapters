@@ -55,10 +55,22 @@ DEFAULT_SPARK_PROPERTIES = {
         "spark.network.crypto.enabled": "true",
     },
     # https://docs.aws.amazon.com/athena/latest/ug/spark-notebooks-cross-account-glue.html
+    # Applied when spark_cross_account_catalog == "hive".
     "spark_cross_account_catalog": {"spark.hadoop.aws.glue.catalog.separator": "/"},
     # https://docs.aws.amazon.com/athena/latest/ug/notebooks-spark-requester-pays.html
     "spark_requester_pays": {"spark.hadoop.fs.s3.useRequesterPaysHeader": "true"},
 }
+
+# Modes of the ``spark_cross_account_catalog`` model config.
+#   none: no cross-account access (default)
+#   hive: Hive metastore Glue client with the ``/`` catalog separator
+#         (``<account_id>/<schema>.<table>``); equivalent to the legacy ``true``
+SPARK_CROSS_ACCOUNT_CATALOG_NONE = "none"
+SPARK_CROSS_ACCOUNT_CATALOG_HIVE = "hive"
+SPARK_CROSS_ACCOUNT_CATALOG_MODES: Tuple[str, ...] = (
+    SPARK_CROSS_ACCOUNT_CATALOG_NONE,
+    SPARK_CROSS_ACCOUNT_CATALOG_HIVE,
+)
 
 LOGGER = AdapterLogger(__name__)
 

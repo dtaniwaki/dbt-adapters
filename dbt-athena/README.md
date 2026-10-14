@@ -734,10 +734,13 @@ The adapter supports Python models using [`spark`](https://docs.aws.amazon.com/a
 - `spark_encryption` (`default=false`)
     - If this flag is set to true, encrypts data in transit between Spark nodes and also encrypts data at rest stored
       locally by Spark.
-- `spark_cross_account_catalog` (`default=false`)
+- `spark_cross_account_catalog` (`default=none`)
+    - One of `none` or `hive`. Booleans are still accepted for backward compatibility: `true` means `hive`
+      and `false` means `none`.
     - When using the Spark Athena workgroup, queries can only be made against catalogs located on the same
       AWS account by default. However, sometimes you want to query another catalog located on an external AWS
-      account. Setting this additional Spark properties parameter to true will enable querying external catalogs.
+      account. Setting this parameter to `hive` enables querying external catalogs through the Hive metastore
+      Glue client (`spark.hadoop.aws.glue.catalog.separator=/`).
       You can use the syntax `external_catalog_id/database.table` to access the external table on the external
       catalog (ex: `999999999999/mydatabase.cloudfront_logs` where 999999999999 is the external catalog ID)
 - `spark_requester_pays` (`default=false`)
@@ -813,7 +816,7 @@ def model(dbt, spark_session):
             "DefaultExecutorDpuSize": 1
         },
         spark_encryption=True,
-        spark_cross_account_catalog=True,
+        spark_cross_account_catalog="hive",
         spark_requester_pays=True
     polling_interval=15,
     timeout=120,

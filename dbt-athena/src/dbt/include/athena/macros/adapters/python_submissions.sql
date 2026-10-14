@@ -165,7 +165,7 @@ execute_query(spark)
   dbt.source() / dbt.ref() without hard-coding account IDs.
 
   The mapping is injected as a Python dict only when the model has
-  `spark_cross_account_catalog: true`. That config causes
+  `spark_cross_account_catalog: hive` (or the legacy `true`). That config causes
   `AthenaSparkSessionConfig` to set `spark.hadoop.aws.glue.catalog.separator`
   to `/` on the Spark session, which is the only form Spark can parse for
   `<account_id>/<schema>.<table>` identifiers. Populating the map without
@@ -173,7 +173,14 @@ execute_query(spark)
   models that do not opt in receive an empty mapping and fall back to the
   legacy `<schema>.<table>` form (local catalog behavior, unchanged).
 -#}
-{%- if config.get("spark_cross_account_catalog", false) -%}
+{%- set cross_account_mode = config.get("spark_cross_account_catalog", none) -%}
+{%- if cross_account_mode is sameas true -%}
+  {%- set cross_account_mode = "hive" -%}
+{%- elif cross_account_mode is string -%}
+  {%- set cross_account_mode = cross_account_mode | trim | lower -%}
+  {%- if cross_account_mode == "true" -%}{%- set cross_account_mode = "hive" -%}{%- endif -%}
+{%- endif -%}
+{%- if cross_account_mode == "hive" -%}
   {%- set cross_account_catalogs = adapter.get_spark_cross_account_catalog_map() -%}
 {%- else -%}
   {%- set cross_account_catalogs = {} -%}
@@ -201,7 +208,7 @@ def get_spark_df(identifier):
     Spark's Glue Catalog Client can resolve when the
     `spark.hadoop.aws.glue.catalog.separator` property is set to '/'. That
     property is set automatically by `AthenaSparkSessionConfig` when the
-    model opts in with `spark_cross_account_catalog: true`; when the model
+    model opts in with `spark_cross_account_catalog: hive`; when the model
     does not opt in, `_CROSS_ACCOUNT_CATALOGS` is empty and we fall back to
     the legacy two-part form.
 

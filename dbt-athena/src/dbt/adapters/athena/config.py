@@ -13,11 +13,41 @@ from dbt.adapters.athena.constants import (
     DEFAULT_SPARK_PROPERTIES,
     LOGGER,
     SPARK_CONNECT_ENGINE_VERSION,
+    SPARK_CROSS_ACCOUNT_CATALOG_HIVE,
+    SPARK_CROSS_ACCOUNT_CATALOG_MODES,
+    SPARK_CROSS_ACCOUNT_CATALOG_NONE,
 )
 
 
 def is_spark_connect_engine_version(value: Any) -> bool:
     return str(value) == SPARK_CONNECT_ENGINE_VERSION
+
+
+def get_spark_cross_account_catalog_mode(value: Any) -> str:
+    """Normalize the ``spark_cross_account_catalog`` model config to a mode name.
+
+    Booleans are accepted for backward compatibility: ``true`` maps to ``hive``
+    and ``false`` (or unset) maps to ``none``.
+
+    Raises:
+        ValueError: If the value is not a boolean or a known mode name.
+    """
+    if value is None or value is False:
+        return SPARK_CROSS_ACCOUNT_CATALOG_NONE
+    if value is True:
+        return SPARK_CROSS_ACCOUNT_CATALOG_HIVE
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        mode = {
+            "true": SPARK_CROSS_ACCOUNT_CATALOG_HIVE,
+            "false": SPARK_CROSS_ACCOUNT_CATALOG_NONE,
+        }.get(mode, mode)
+        if mode in SPARK_CROSS_ACCOUNT_CATALOG_MODES:
+            return mode
+    raise ValueError(
+        "spark_cross_account_catalog must be a boolean or one of "
+        f"{SPARK_CROSS_ACCOUNT_CATALOG_MODES}. Got: {value!r}"
+    )
 
 
 @lru_cache()
@@ -120,7 +150,9 @@ class AthenaSparkSessionConfig:
         """
         table_type = self.config.get("table_type", "hive")
         spark_encryption = self.config.get("spark_encryption", False)
-        spark_cross_account_catalog = self.config.get("spark_cross_account_catalog", False)
+        spark_cross_account_catalog = get_spark_cross_account_catalog_mode(
+            self.config.get("spark_cross_account_catalog")
+        )
         spark_requester_pays = self.config.get("spark_requester_pays", False)
 
         default_spark_properties: Dict[str, str] = dict(
@@ -132,7 +164,7 @@ class AthenaSparkSessionConfig:
             **DEFAULT_SPARK_PROPERTIES.get("spark_encryption", {}) if spark_encryption else {},
             **(
                 DEFAULT_SPARK_PROPERTIES.get("spark_cross_account_catalog", {})
-                if spark_cross_account_catalog
+                if spark_cross_account_catalog == SPARK_CROSS_ACCOUNT_CATALOG_HIVE
                 else {}
             ),
             **(

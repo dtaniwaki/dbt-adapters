@@ -1033,7 +1033,8 @@ class AthenaAdapter(SQLAdapter):
         ``dbt.source()`` / ``dbt.ref()`` identifiers that reference
         federated GLUE catalogs into the
         ``<account_id>/<schema>.<table>`` form required by Spark's
-        Glue Catalog Client when ``spark_cross_account_catalog`` is enabled.
+        Glue Catalog Client when ``spark_cross_account_catalog`` is ``hive``
+        (or the legacy ``true``).
 
         The default catalog (``awsdatacatalog``) is excluded because it is
         always local and does not require the account-id prefix. Non-GLUE
