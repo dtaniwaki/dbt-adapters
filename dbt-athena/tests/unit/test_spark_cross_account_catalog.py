@@ -176,6 +176,87 @@ class TestSetEngineConfigIcebergMode:
         assert not any(key.startswith("spark.sql.catalog.") for key in spark_properties)
 
 
+class TestCrossAccountCatalogRegion:
+    catalogs = {"shared_catalog": SHARED_ACCOUNT_ID}
+    REGION_KEY = "spark.sql.catalog.shared_catalog.client.region"
+
+    def _spark_properties(self, model_config):
+        return AthenaSparkSessionConfig(
+            model_config, cross_account_catalogs=self.catalogs, region_name="us-east-1"
+        ).set_engine_config()["SparkProperties"]
+
+    def test_model_config_overrides_profile_region(self):
+        properties = self._spark_properties(
+            {
+                "spark_cross_account_catalog": "iceberg",
+                "spark_cross_account_catalog_region": "ap-northeast-1",
+            }
+        )
+        assert properties[self.REGION_KEY] == "ap-northeast-1"
+        # the other generated properties are unchanged
+        for key, value in EXPECTED_SHARED_CATALOG_PROPERTIES.items():
+            if key != self.REGION_KEY:
+                assert properties[key] == value
+
+    def test_defaults_to_profile_region(self):
+        properties = self._spark_properties({"spark_cross_account_catalog": "iceberg"})
+        assert properties[self.REGION_KEY] == "us-east-1"
+
+    def test_region_is_stripped(self):
+        properties = self._spark_properties(
+            {
+                "spark_cross_account_catalog": "iceberg",
+                "spark_cross_account_catalog_region": " ap-northeast-1 ",
+            }
+        )
+        assert properties[self.REGION_KEY] == "ap-northeast-1"
+
+    @pytest.mark.parametrize("value", ["", "   ", 1, True, ["ap-northeast-1"]])
+    def test_rejects_invalid_region(self, value):
+        with pytest.raises(ValueError, match="spark_cross_account_catalog_region"):
+            self._spark_properties(
+                {
+                    "spark_cross_account_catalog": "iceberg",
+                    "spark_cross_account_catalog_region": value,
+                }
+            )
+
+    def test_overrides_region_in_classifications_on_spark_connect(self):
+        engine_config = AthenaSparkSessionConfig(
+            {
+                "spark_cross_account_catalog": "iceberg",
+                "spark_cross_account_catalog_region": "ap-northeast-1",
+                "spark_engine_version": "3.5",
+                "engine_config": {
+                    "MaxConcurrentDpus": 4,
+                    "Classifications": [
+                        {
+                            "Name": "spark-defaults",
+                            "Properties": {self.REGION_KEY: "us-east-1"},
+                        }
+                    ],
+                },
+            },
+            cross_account_catalogs=self.catalogs,
+            region_name="us-east-1",
+        ).set_engine_config()
+        spark_defaults = next(
+            c for c in engine_config["Classifications"] if c["Name"] == "spark-defaults"
+        )
+        assert spark_defaults["Properties"][self.REGION_KEY] == "ap-northeast-1"
+
+    @pytest.mark.parametrize("mode", ["hive", "none"])
+    def test_ignored_by_other_modes(self, mode):
+        properties = self._spark_properties(
+            {
+                "spark_cross_account_catalog": mode,
+                "spark_cross_account_catalog_region": "ap-northeast-1",
+            }
+        )
+        assert not any(key.startswith("spark.sql.catalog.") for key in properties)
+        assert (SEPARATOR_KEY in properties) == (mode == "hive")
+
+
 @pytest.mark.usefixtures("athena_credentials")
 class TestPythonJobHelperCrossAccountCatalogs:
     @mock_aws

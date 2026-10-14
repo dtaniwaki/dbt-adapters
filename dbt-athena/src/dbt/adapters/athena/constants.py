@@ -78,7 +78,8 @@ SPARK_CROSS_ACCOUNT_CATALOG_MODES: Tuple[str, ...] = (
 
 # Spark properties generated per catalog in the ``iceberg`` mode. ``{prefix}`` is
 # ``spark.sql.catalog.<catalog name>``. ``glue.id`` / ``glue.account-id`` and
-# ``client.region`` are added from the catalog registration and the profile.
+# ``client.region`` are added from the catalog registration and the profile (or
+# ``spark_cross_account_catalog_region`` of the model config).
 # https://docs.aws.amazon.com/athena/latest/ug/notebooks-spark-table-formats-apache-iceberg.html
 # https://iceberg.apache.org/docs/latest/aws/#glue-catalog
 ICEBERG_CROSS_ACCOUNT_CATALOG_PROPERTIES = {

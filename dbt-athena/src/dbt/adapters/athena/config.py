@@ -103,7 +103,8 @@ class AthenaSparkSessionConfig:
                 registered cross-account GLUE catalogs. Used by the ``iceberg`` mode of
                 ``spark_cross_account_catalog``.
             region_name: Region of the Glue catalogs, set as ``client.region`` of the
-                named Iceberg catalogs in the ``iceberg`` mode.
+                named Iceberg catalogs in the ``iceberg`` mode unless the model config
+                ``spark_cross_account_catalog_region`` overrides it.
         """
         self.config = config
         self.cross_account_catalogs = dict(cross_account_catalogs or {})
@@ -268,8 +269,26 @@ class AthenaSparkSessionConfig:
                 "data catalog is registered in Athena; no named catalog is added"
             )
         return build_iceberg_cross_account_catalog_properties(
-            self.cross_account_catalogs, self.region_name
+            self.cross_account_catalogs, self.cross_account_catalog_region
         )
+
+    @property
+    def cross_account_catalog_region(self) -> Optional[str]:
+        """Region of the named Iceberg catalogs in the ``iceberg`` mode.
+
+        ``spark_cross_account_catalog_region`` of the model config takes precedence, so
+        that catalogs registered in another region than the profile can be read. It
+        falls back to the region of the profile.
+        """
+        region = self.config.get("spark_cross_account_catalog_region")
+        if region is None:
+            return self.region_name
+        if not isinstance(region, str) or not region.strip():
+            raise ValueError(
+                "spark_cross_account_catalog_region must be a non-empty string "
+                f"(an AWS region name). Got: {region!r}"
+            )
+        return region.strip()
 
     @staticmethod
     def _build_calculations_engine_config(

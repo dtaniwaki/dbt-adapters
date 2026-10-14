@@ -765,6 +765,11 @@ The adapter supports Python models using [`spark`](https://docs.aws.amazon.com/a
       Iceberg tables only: non-Iceberg tables in the external catalog are not visible through the named catalog
       (`TABLE_OR_VIEW_NOT_FOUND`). `spark_catalog` is left unchanged, so `dbt.this` and local tables keep
       working as before. The generated properties take precedence over the same keys in `engine_config`.
+- `spark_cross_account_catalog_region` (`default=<region of the profile>`)
+    - Only used by the `iceberg` mode of `spark_cross_account_catalog`. AWS region set as `client.region` of
+      the named Iceberg catalogs, for external catalogs whose Glue Data Catalog and S3 data live in another
+      region than the Spark workgroup (ex: `ap-northeast-1`). It applies to all the named catalogs.
+      The `hive` mode cannot read catalogs of another region.
 - `spark_requester_pays` (`default=false`)
     - When an Amazon S3 bucket is configured as requester pays, the account of the user running the query is charged for
       data access and data transfer fees associated with the query.
