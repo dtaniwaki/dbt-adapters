@@ -745,8 +745,9 @@ The adapter supports Python models using [`spark`](https://docs.aws.amazon.com/a
       Iceberg tables, so a listed catalog is registered as a named Spark catalog on first use instead.
       Catalogs not listed keep the behavior above.
     - `type`: required. Only `iceberg` is supported.
-    - `glue_id`: the Glue catalog ID. Defaults to the catalog ID of the GLUE data catalog registered in Athena
-      (which needs `athena:ListDataCatalogs` and `athena:GetDataCatalog`).
+    - `glue_id`: the Glue catalog ID, as a 12-digit string (quote it in YAML). Defaults to the catalog ID of
+      the GLUE data catalog registered in Athena (which needs `athena:ListDataCatalogs` and
+      `athena:GetDataCatalog`).
     - `region`: the region of the Glue catalog and its S3 data. Defaults to the region of the Spark session.
     - Example:
       ```yaml

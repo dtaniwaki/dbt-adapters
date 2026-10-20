@@ -54,6 +54,7 @@ def get_catalog_type(catalog: Optional[DataCatalogTypeDef]) -> Optional[AthenaCa
 
 
 RESERVED_SPARK_CATALOG_NAMES = ("awsdatacatalog", "spark_catalog")
+SPARK_CATALOG_OVERRIDE_KEYS = frozenset({"type", "glue_id", "region"})
 
 
 def resolve_spark_catalog_overrides(
@@ -64,7 +65,7 @@ def resolve_spark_catalog_overrides(
     A catalog without ``glue_id`` takes its ID from ``lookup_catalog_ids()``
     (Athena data catalog name -> catalog ID), which is only called when needed.
     """
-    if not overrides:
+    if overrides is None:
         return {}
     if not isinstance(overrides, dict):
         raise ValueError(f"spark_catalog_overrides must be a mapping. Got: {overrides!r}")
@@ -78,18 +79,29 @@ def resolve_spark_catalog_overrides(
             raise ValueError(f"spark_catalog_overrides cannot override {name!r}")
         if not isinstance(spec, dict):
             raise ValueError(f"spark_catalog_overrides[{name!r}] must be a mapping. Got: {spec!r}")
+        unknown_keys = sorted(set(spec) - SPARK_CATALOG_OVERRIDE_KEYS)
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown key(s) in spark_catalog_overrides[{name!r}]: {unknown_keys}. "
+                f"Allowed: {sorted(SPARK_CATALOG_OVERRIDE_KEYS)}"
+            )
         catalog_type = spec.get("type")
-        if catalog_type not in SPARK_CATALOG_TYPES:
+        if not isinstance(catalog_type, str) or catalog_type not in SPARK_CATALOG_TYPES:
             raise ValueError(
                 f"spark_catalog_overrides[{name!r}].type must be one of "
                 f"{sorted(SPARK_CATALOG_TYPES)}. Got: {catalog_type!r}"
             )
         templates = SPARK_CATALOG_TYPES[catalog_type]
         glue_id = spec.get("glue_id")
-        if not glue_id:
+        if glue_id is None:
             if catalog_ids is None:
                 catalog_ids = lookup_catalog_ids()
             glue_id = catalog_ids.get(name)
+        elif not isinstance(glue_id, str) or not re.fullmatch(r"\d{12}", glue_id):
+            raise ValueError(
+                f"spark_catalog_overrides[{name!r}].glue_id must be a 12-digit string "
+                f"(quote it in YAML). Got: {glue_id!r}"
+            )
         if not glue_id:
             raise ValueError(
                 f"spark_catalog_overrides[{name!r}]: set glue_id, or register {name!r} "

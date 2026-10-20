@@ -73,6 +73,9 @@ def test_ellipsis_comment(max_len, expected):
     assert expected == ellipsis_comment("abc def ghi", max_len=max_len)
 
 
+GLUE_ID = "123456789012"
+
+
 class TestResolveSparkCatalogOverrides:
     @staticmethod
     def _no_lookup():
@@ -84,7 +87,7 @@ class TestResolveSparkCatalogOverrides:
 
     def test_iceberg_with_glue_id_and_region(self):
         res = resolve_spark_catalog_overrides(
-            {"shared": {"type": "iceberg", "glue_id": "123456789012", "region": "eu-west-1"}},
+            {"shared": {"type": "iceberg", "glue_id": GLUE_ID, "region": "eu-west-1"}},
             self._no_lookup,
         )
         assert res == {
@@ -100,7 +103,7 @@ class TestResolveSparkCatalogOverrides:
 
     def test_region_is_optional(self):
         res = resolve_spark_catalog_overrides(
-            {"shared": {"type": "iceberg", "glue_id": "123456789012"}}, self._no_lookup
+            {"shared": {"type": "iceberg", "glue_id": GLUE_ID}}, self._no_lookup
         )
         assert "spark.sql.catalog.shared.client.region" not in res["shared"]
 
@@ -122,16 +125,38 @@ class TestResolveSparkCatalogOverrides:
         "overrides",
         [
             ["shared"],
+            [],
+            "",
+            0,
             {"shared": "iceberg"},
             {"shared": {}},
-            {"shared": {"type": "hive", "glue_id": "1"}},
+            {"shared": {"type": "hive", "glue_id": GLUE_ID}},
+            {"shared": {"type": ["iceberg"], "glue_id": GLUE_ID}},
             {"shared": {"type": "iceberg"}},
-            {"awsdatacatalog": {"type": "iceberg", "glue_id": "1"}},
-            {"spark_catalog": {"type": "iceberg", "glue_id": "1"}},
-            {"a.b": {"type": "iceberg", "glue_id": "1"}},
-            {"a`b": {"type": "iceberg", "glue_id": "1"}},
+            {"shared": {"type": "iceberg", "glue-id": GLUE_ID}},
+            {"shared": {"type": "iceberg", "glue_id": 123456789012}},
+            {"shared": {"type": "iceberg", "glue_id": 0}},
+            {"shared": {"type": "iceberg", "glue_id": ""}},
+            {"shared": {"type": "iceberg", "glue_id": "12345"}},
+            {"awsdatacatalog": {"type": "iceberg", "glue_id": GLUE_ID}},
+            {"spark_catalog": {"type": "iceberg", "glue_id": GLUE_ID}},
+            {"a.b": {"type": "iceberg", "glue_id": GLUE_ID}},
+            {"a`b": {"type": "iceberg", "glue_id": GLUE_ID}},
         ],
     )
     def test_invalid(self, overrides):
         with pytest.raises(ValueError):
             resolve_spark_catalog_overrides(overrides, lambda: {})
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            {"type": "iceberg", "glue-id": GLUE_ID},
+            {"type": "iceberg", "regoin": "eu-west-1"},
+            {"type": "iceberg", "glue_id": 0},
+            {"type": "iceberg", "glue_id": ""},
+        ],
+    )
+    def test_invalid_even_when_registered_in_athena(self, spec):
+        with pytest.raises(ValueError):
+            resolve_spark_catalog_overrides({"shared": spec}, lambda: {"shared": GLUE_ID})
