@@ -60,6 +60,7 @@ from dbt.adapters.athena.utils import (
     get_catalog_type,
     get_chunks,
     is_valid_table_parameter_key,
+    resolve_spark_catalog_overrides,
     stringify_table_parameter_value,
 )
 from dbt.adapters.base import ConstraintSupport, PythonJobHelper, available
@@ -772,6 +773,15 @@ class AthenaAdapter(SQLAdapter):
                 if catalog_id:
                     result[name] = catalog_id
         return result
+
+    @available
+    def get_spark_catalog_overrides(self, overrides: Any) -> Dict[str, Dict[str, str]]:
+        """
+        Resolve the ``spark_catalog_overrides`` model config into the Spark
+        properties that register each named catalog. The Athena data catalogs
+        are only listed when a catalog does not set ``glue_id``.
+        """
+        return resolve_spark_catalog_overrides(overrides, self.get_spark_cross_account_catalog_map)
 
     @available
     def list_relations_without_caching(

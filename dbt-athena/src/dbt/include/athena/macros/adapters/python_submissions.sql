@@ -92,6 +92,14 @@ execute_query(spark)
   {%- set cross_account_catalogs = {} -%}
 {%- endif -%}
 _CROSS_ACCOUNT_CATALOGS = {{ cross_account_catalogs | tojson }}
+_SPARK_CATALOG_OVERRIDES = {{ adapter.get_spark_catalog_overrides(config.get("spark_catalog_overrides", {})) | tojson }}
+_REGISTERED_CATALOGS = set()
+
+def _register_catalog(name):
+    if name not in _REGISTERED_CATALOGS:
+        for key, value in _SPARK_CATALOG_OVERRIDES[name].items():
+            spark.conf.set(key, value)
+        _REGISTERED_CATALOGS.add(name)
 
 def get_spark_df(identifier):
     """
@@ -121,6 +129,9 @@ def get_spark_df(identifier):
     The backtick quoting around `account_id/schema` is required because
     `spark.table()` internally parses the name as a SQL identifier, and `/`
     is not valid in an unquoted identifier.
+
+    A catalog listed in `spark_catalog_overrides` is instead registered on
+    first use as a named Spark catalog and read as '`catalog`.schema.table'.
     """
     parts = identifier.replace('"', '').split(".")
     if len(parts) < 3:
@@ -128,6 +139,9 @@ def get_spark_df(identifier):
     catalog, schema, table = parts[0], parts[1], parts[2]
     if catalog.lower() == "awsdatacatalog":
         return spark.table(f"{schema}.{table}")
+    if catalog in _SPARK_CATALOG_OVERRIDES:
+        _register_catalog(catalog)
+        return spark.table(f"`{catalog}`.{schema}.{table}")
     account_id = _CROSS_ACCOUNT_CATALOGS.get(catalog)
     if account_id is None:
         return spark.table(f"{schema}.{table}")

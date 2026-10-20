@@ -1,11 +1,11 @@
 import json
 import re
 from enum import Enum
-from typing import Any, Generator, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, TypeVar
 
 from mypy_boto3_athena.type_defs import DataCatalogTypeDef
 
-from dbt.adapters.athena.constants import LOGGER
+from dbt.adapters.athena.constants import LOGGER, SPARK_CATALOG_TYPES
 
 
 def clean_sql_comment(comment: str) -> str:
@@ -51,6 +51,59 @@ class AthenaCatalogType(Enum):
 
 def get_catalog_type(catalog: Optional[DataCatalogTypeDef]) -> Optional[AthenaCatalogType]:
     return AthenaCatalogType(catalog["Type"]) if catalog else None
+
+
+RESERVED_SPARK_CATALOG_NAMES = ("awsdatacatalog", "spark_catalog")
+
+
+def resolve_spark_catalog_overrides(
+    overrides: Any, lookup_catalog_ids: Callable[[], Mapping[str, str]]
+) -> Dict[str, Dict[str, str]]:
+    """Turn ``spark_catalog_overrides`` into Spark properties per catalog name.
+
+    A catalog without ``glue_id`` takes its ID from ``lookup_catalog_ids()``
+    (Athena data catalog name -> catalog ID), which is only called when needed.
+    """
+    if not overrides:
+        return {}
+    if not isinstance(overrides, dict):
+        raise ValueError(f"spark_catalog_overrides must be a mapping. Got: {overrides!r}")
+
+    resolved: Dict[str, Dict[str, str]] = {}
+    catalog_ids: Optional[Mapping[str, str]] = None
+    for name, spec in overrides.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[\w-]+", name):
+            raise ValueError(f"Invalid catalog name in spark_catalog_overrides: {name!r}")
+        if name.lower() in RESERVED_SPARK_CATALOG_NAMES:
+            raise ValueError(f"spark_catalog_overrides cannot override {name!r}")
+        if not isinstance(spec, dict):
+            raise ValueError(f"spark_catalog_overrides[{name!r}] must be a mapping. Got: {spec!r}")
+        catalog_type = spec.get("type")
+        if catalog_type not in SPARK_CATALOG_TYPES:
+            raise ValueError(
+                f"spark_catalog_overrides[{name!r}].type must be one of "
+                f"{sorted(SPARK_CATALOG_TYPES)}. Got: {catalog_type!r}"
+            )
+        templates = SPARK_CATALOG_TYPES[catalog_type]
+        glue_id = spec.get("glue_id")
+        if not glue_id:
+            if catalog_ids is None:
+                catalog_ids = lookup_catalog_ids()
+            glue_id = catalog_ids.get(name)
+        if not glue_id:
+            raise ValueError(
+                f"spark_catalog_overrides[{name!r}]: set glue_id, or register {name!r} "
+                "as a GLUE data catalog in Athena"
+            )
+
+        prefix = f"spark.sql.catalog.{name}"
+        properties = {key.format(prefix=prefix): value for key, value in templates.items()}
+        properties[f"{prefix}.glue.id"] = str(glue_id)
+        properties[f"{prefix}.glue.account-id"] = str(glue_id)
+        if spec.get("region"):
+            properties[f"{prefix}.client.region"] = str(spec["region"])
+        resolved[name] = properties
+    return resolved
 
 
 T = TypeVar("T")

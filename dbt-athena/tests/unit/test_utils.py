@@ -5,6 +5,7 @@ from dbt.adapters.athena.utils import (
     ellipsis_comment,
     get_chunks,
     is_valid_table_parameter_key,
+    resolve_spark_catalog_overrides,
     stringify_table_parameter_value,
 )
 
@@ -70,3 +71,67 @@ def test_get_chunks_more_elements_than_chunk():
 )
 def test_ellipsis_comment(max_len, expected):
     assert expected == ellipsis_comment("abc def ghi", max_len=max_len)
+
+
+class TestResolveSparkCatalogOverrides:
+    @staticmethod
+    def _no_lookup():
+        raise AssertionError("catalog IDs must not be looked up")
+
+    def test_empty(self):
+        assert resolve_spark_catalog_overrides({}, self._no_lookup) == {}
+        assert resolve_spark_catalog_overrides(None, self._no_lookup) == {}
+
+    def test_iceberg_with_glue_id_and_region(self):
+        res = resolve_spark_catalog_overrides(
+            {"shared": {"type": "iceberg", "glue_id": "123456789012", "region": "eu-west-1"}},
+            self._no_lookup,
+        )
+        assert res == {
+            "shared": {
+                "spark.sql.catalog.shared": "org.apache.iceberg.spark.SparkCatalog",
+                "spark.sql.catalog.shared.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+                "spark.sql.catalog.shared.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+                "spark.sql.catalog.shared.glue.id": "123456789012",
+                "spark.sql.catalog.shared.glue.account-id": "123456789012",
+                "spark.sql.catalog.shared.client.region": "eu-west-1",
+            }
+        }
+
+    def test_region_is_optional(self):
+        res = resolve_spark_catalog_overrides(
+            {"shared": {"type": "iceberg", "glue_id": "123456789012"}}, self._no_lookup
+        )
+        assert "spark.sql.catalog.shared.client.region" not in res["shared"]
+
+    def test_glue_id_defaults_to_registered_data_catalog(self):
+        calls = []
+
+        def lookup():
+            calls.append(1)
+            return {"shared": "123456789012", "other": "210987654321"}
+
+        res = resolve_spark_catalog_overrides(
+            {"shared": {"type": "iceberg"}, "other": {"type": "iceberg"}}, lookup
+        )
+        assert res["shared"]["spark.sql.catalog.shared.glue.id"] == "123456789012"
+        assert res["other"]["spark.sql.catalog.other.glue.id"] == "210987654321"
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            ["shared"],
+            {"shared": "iceberg"},
+            {"shared": {}},
+            {"shared": {"type": "hive", "glue_id": "1"}},
+            {"shared": {"type": "iceberg"}},
+            {"awsdatacatalog": {"type": "iceberg", "glue_id": "1"}},
+            {"spark_catalog": {"type": "iceberg", "glue_id": "1"}},
+            {"a.b": {"type": "iceberg", "glue_id": "1"}},
+            {"a`b": {"type": "iceberg", "glue_id": "1"}},
+        ],
+    )
+    def test_invalid(self, overrides):
+        with pytest.raises(ValueError):
+            resolve_spark_catalog_overrides(overrides, lambda: {})
