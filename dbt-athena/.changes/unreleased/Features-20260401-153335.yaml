@@ -1,0 +1,6 @@
+kind: Features
+body: Add `disable_batch_fallback` config to optionally raise TOO_MANY_OPEN_PARTITIONS instead of falling back to batch mode
+time: 2026-04-01T15:33:35.505264+09:00
+custom:
+  Author: dtaniwaki
+  Issue: "0"

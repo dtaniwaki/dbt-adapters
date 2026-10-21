@@ -22,6 +22,7 @@
   {%- set versions_to_keep = config.get('versions_to_keep', default=4) -%}
   {%- set external_location = config.get('external_location', default=none) -%}
   {%- set force_batch = config.get('force_batch', False) | as_bool -%}
+  {%- set disable_batch_fallback = config.get('disable_batch_fallback', False) | as_bool -%}
   {%- set target_relation = api.Relation.create(identifier=identifier,
                                                 schema=schema,
                                                 database=database,
@@ -57,7 +58,7 @@
       {%- endif -%}
 
       -- create tmp table
-      {%- set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch) -%}
+      {%- set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch, disable_batch_fallback) -%}
       -- Execute python code that is available in query result object
       {%- if language == 'python' -%}
         {% call statement('create_table', language=language) %}
@@ -77,7 +78,7 @@
       {%- if old_relation is not none -%}
         {{ drop_relation(old_relation) }}
       {%- endif -%}
-      {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
+      {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch, disable_batch_fallback) -%}
       -- Execute python code that is available in query result object
       {%- if language == 'python' -%}
         {% call statement('create_table', language=language) %}
@@ -92,7 +93,7 @@
   {%- else -%}
 
     {%- if old_relation is none -%}
-      {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
+      {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch, disable_batch_fallback) -%}
       -- Execute python code that is available in query result object
       {%- if language == 'python' -%}
         {% call statement('create_table', language=language) %}
@@ -112,7 +113,7 @@
       {%- endif -%}
     {%- else -%}
       {%- if old_relation.is_view -%}
-        {%- set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch) -%}
+        {%- set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch, disable_batch_fallback) -%}
         -- Execute python code that is available in query result object
         {%- if language == 'python' -%}
           {% call statement('create_table', language=language) %}
@@ -135,7 +136,7 @@
           {%- do drop_relation(old_bkp_relation) -%}
         {%- endif -%}
 
-        {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch) %}
+        {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch, disable_batch_fallback) %}
         -- Execute python code that is available in query result object
         {%- if language == 'python' -%}
           {% call statement('create_table', language=language) %}
