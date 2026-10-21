@@ -1,9 +1,10 @@
 import json
 import re
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Literal, Mapping, Optional, TypeVar
 
 from mypy_boto3_athena.type_defs import DataCatalogTypeDef
+from pydantic import BaseModel, Field, field_validator
 
 from dbt.adapters.athena.constants import LOGGER, SPARK_CATALOG_TYPES
 
@@ -57,65 +58,92 @@ RESERVED_SPARK_CATALOG_NAMES = ("awsdatacatalog", "spark_catalog")
 SPARK_CATALOG_OVERRIDE_KEYS = frozenset({"type", "glue_id", "region"})
 
 
+class CatalogOverrideSpec(BaseModel):
+    """Validated catalog override specification for spark_catalog_overrides."""
+
+    name: str = Field(pattern=r"[\w-]+")
+    type: Literal["iceberg"]
+    glue_id: Optional[str] = Field(None, pattern=r"\d{12}")
+    region: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_not_reserved(cls, v: str) -> str:
+        if v.lower() in RESERVED_SPARK_CATALOG_NAMES:
+            raise ValueError(f"Cannot override reserved catalog: {v!r}")
+        return v
+
+    @classmethod
+    def from_user_dict(cls, name: str, spec: dict) -> "CatalogOverrideSpec":
+        """Parse user input with validation and better error messages."""
+        if not isinstance(spec, dict):
+            raise ValueError(f"spark_catalog_overrides[{name!r}] must be a dict")
+
+        unknown = set(spec) - SPARK_CATALOG_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown key(s) in spark_catalog_overrides[{name!r}]: {sorted(unknown)}. "
+                f"Allowed: {sorted(SPARK_CATALOG_OVERRIDE_KEYS)}"
+            )
+
+        try:
+            return cls(name=name, **spec)
+        except Exception as e:
+            raise ValueError(f"spark_catalog_overrides[{name!r}]: {e}") from e
+
+    def resolve_glue_id(self, catalog_ids: Mapping[str, str]) -> str:
+        """Resolve glue_id from catalog_ids if not set."""
+        if self.glue_id:
+            return self.glue_id
+
+        glue_id = catalog_ids.get(self.name)
+        if not glue_id:
+            raise ValueError(
+                f"spark_catalog_overrides[{self.name!r}]: set glue_id, or register {self.name!r} "
+                "as a GLUE catalog in Athena"
+            )
+        return glue_id
+
+    def to_spark_properties(self, glue_id: str) -> Dict[str, str]:
+        """Build Spark properties for this catalog."""
+        templates = SPARK_CATALOG_TYPES[self.type]
+        prefix = f"spark.sql.catalog.{self.name}"
+
+        properties = {key.format(prefix=prefix): value for key, value in templates.items()}
+        properties[f"{prefix}.glue.id"] = glue_id
+        properties[f"{prefix}.glue.account-id"] = glue_id
+
+        if self.region:
+            properties[f"{prefix}.client.region"] = self.region
+
+        return properties
+
+
 def resolve_spark_catalog_overrides(
     overrides: Any, lookup_catalog_ids: Callable[[], Mapping[str, str]]
 ) -> Dict[str, Dict[str, str]]:
-    """Turn ``spark_catalog_overrides`` into Spark properties per catalog name.
+    """Turn spark_catalog_overrides into Spark properties per catalog.
 
-    A catalog without ``glue_id`` takes its ID from ``lookup_catalog_ids()``
+    A catalog without glue_id takes its ID from lookup_catalog_ids()
     (Athena data catalog name -> catalog ID), which is only called when needed.
     """
-    if overrides is None:
+    if not overrides:
         return {}
     if not isinstance(overrides, dict):
-        raise ValueError(f"spark_catalog_overrides must be a mapping. Got: {overrides!r}")
+        raise ValueError(
+            f"spark_catalog_overrides must be a dict. Got: {type(overrides).__name__}"
+        )
 
-    resolved: Dict[str, Dict[str, str]] = {}
-    catalog_ids: Optional[Mapping[str, str]] = None
-    for name, spec in overrides.items():
-        if not isinstance(name, str) or not re.fullmatch(r"[\w-]+", name):
-            raise ValueError(f"Invalid catalog name in spark_catalog_overrides: {name!r}")
-        if name.lower() in RESERVED_SPARK_CATALOG_NAMES:
-            raise ValueError(f"spark_catalog_overrides cannot override {name!r}")
-        if not isinstance(spec, dict):
-            raise ValueError(f"spark_catalog_overrides[{name!r}] must be a mapping. Got: {spec!r}")
-        unknown_keys = sorted(set(spec) - SPARK_CATALOG_OVERRIDE_KEYS)
-        if unknown_keys:
-            raise ValueError(
-                f"Unknown key(s) in spark_catalog_overrides[{name!r}]: {unknown_keys}. "
-                f"Allowed: {sorted(SPARK_CATALOG_OVERRIDE_KEYS)}"
-            )
-        catalog_type = spec.get("type")
-        if not isinstance(catalog_type, str) or catalog_type not in SPARK_CATALOG_TYPES:
-            raise ValueError(
-                f"spark_catalog_overrides[{name!r}].type must be one of "
-                f"{sorted(SPARK_CATALOG_TYPES)}. Got: {catalog_type!r}"
-            )
-        templates = SPARK_CATALOG_TYPES[catalog_type]
-        glue_id = spec.get("glue_id")
-        if glue_id is None:
-            if catalog_ids is None:
-                catalog_ids = lookup_catalog_ids()
-            glue_id = catalog_ids.get(name)
-        elif not isinstance(glue_id, str) or not re.fullmatch(r"\d{12}", glue_id):
-            raise ValueError(
-                f"spark_catalog_overrides[{name!r}].glue_id must be a 12-digit string "
-                f"(quote it in YAML). Got: {glue_id!r}"
-            )
-        if not glue_id:
-            raise ValueError(
-                f"spark_catalog_overrides[{name!r}]: set glue_id, or register {name!r} "
-                "as a GLUE data catalog in Athena"
-            )
+    specs = [CatalogOverrideSpec.from_user_dict(name, spec) for name, spec in overrides.items()]
 
-        prefix = f"spark.sql.catalog.{name}"
-        properties = {key.format(prefix=prefix): value for key, value in templates.items()}
-        properties[f"{prefix}.glue.id"] = str(glue_id)
-        properties[f"{prefix}.glue.account-id"] = str(glue_id)
-        if spec.get("region"):
-            properties[f"{prefix}.client.region"] = str(spec["region"])
-        resolved[name] = properties
-    return resolved
+    catalog_ids = None
+    if any(spec.glue_id is None for spec in specs):
+        catalog_ids = lookup_catalog_ids()
+
+    return {
+        spec.name: spec.to_spark_properties(spec.resolve_glue_id(catalog_ids or {}))
+        for spec in specs
+    }
 
 
 T = TypeVar("T")
