@@ -61,9 +61,9 @@ SPARK_CATALOG_OVERRIDE_KEYS = frozenset({"type", "glue_id", "region"})
 class CatalogOverrideSpec(BaseModel):
     """Validated catalog override specification for spark_catalog_overrides."""
 
-    name: str = Field(pattern=r"[\w-]+")
+    name: str = Field(pattern=r"^[\w-]+$")
     type: Literal["iceberg"]
-    glue_id: Optional[str] = Field(None, pattern=r"\d{12}")
+    glue_id: Optional[str] = Field(None, pattern=r"^\d{12}$")
     region: Optional[str] = None
 
     @field_validator("name")
