@@ -93,6 +93,7 @@ from dbt.adapters.athena.utils import (
     get_catalog_type,
     get_chunks,
     is_valid_table_parameter_key,
+    resolve_spark_catalog_overrides,
     stringify_table_parameter_value,
 )
 from dbt.adapters.base import ConstraintSupport, PythonJobHelper, available
@@ -1022,6 +1023,63 @@ class AthenaAdapter(SQLAdapter):
                 )
             return athena.get_data_catalog(Name=database)["DataCatalog"]
         return None
+
+    @available
+    @lru_cache()
+    def get_spark_cross_account_catalog_map(self) -> Dict[str, str]:
+        """
+        Build a mapping of Athena Data Catalog name -> AWS account ID for all
+        registered cross-account GLUE catalogs.
+
+        Used by the Python (Spark) submission macro to translate
+        ``dbt.source()`` / ``dbt.ref()`` identifiers that reference
+        federated GLUE catalogs into the
+        ``<account_id>/<schema>.<table>`` form required by Spark's
+        Glue Catalog Client when ``spark_cross_account_catalog`` is enabled.
+
+        The default catalog (``awsdatacatalog``) is excluded because it is
+        always local and does not require the account-id prefix. Non-GLUE
+        catalogs (LAMBDA/HIVE/etc.) are excluded because Spark's Glue Catalog
+        Client cannot read from them.
+
+        Requires ``athena:ListDataCatalogs`` and ``athena:GetDataCatalog``
+        permissions. The result is cached per adapter instance to avoid
+        repeated API calls.
+        """
+        conn = self.connections.get_thread_connection()
+        creds = conn.credentials
+        client = conn.handle
+        with boto3_client_lock:
+            athena = client.session.client(
+                "athena",
+                region_name=client.region_name,
+                config=get_boto3_config(num_retries=creds.effective_num_retries),
+            )
+
+        result: Dict[str, str] = {}
+        paginator = athena.get_paginator("list_data_catalogs")
+        for page in paginator.paginate():
+            for summary in page.get("DataCatalogsSummary", []):
+                name = summary.get("CatalogName")
+                catalog_type = summary.get("Type")
+                if not name or name.lower() == "awsdatacatalog" or catalog_type != "GLUE":
+                    continue
+                data_catalog = athena.get_data_catalog(Name=name).get("DataCatalog")
+                if not data_catalog:
+                    continue
+                catalog_id = get_catalog_id(data_catalog)
+                if catalog_id:
+                    result[name] = catalog_id
+        return result
+
+    @available
+    def get_spark_catalog_overrides(self, overrides: Any) -> Dict[str, Dict[str, str]]:
+        """
+        Resolve the ``spark_catalog_overrides`` model config into the Spark
+        properties that register each named catalog. The Athena data catalogs
+        are only listed when a catalog does not set ``glue_id``.
+        """
+        return resolve_spark_catalog_overrides(overrides, self.get_spark_cross_account_catalog_map)
 
     @available
     def list_relations_without_caching(
