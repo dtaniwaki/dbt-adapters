@@ -61,10 +61,10 @@ SPARK_CATALOG_OVERRIDE_KEYS = frozenset({"type", "glue_id", "region"})
 class CatalogOverrideSpec(BaseModel):
     """Validated catalog override specification for spark_catalog_overrides."""
 
-    name: str = Field(pattern=r"^[\w-]+$")
+    name: str = Field(pattern=r"^[\w][\w-]*[\w]$|^[\w]$")
     type: Literal["iceberg"]
     glue_id: Optional[str] = Field(None, pattern=r"^\d{12}$")
-    region: Optional[str] = None
+    region: Optional[str] = Field(None, pattern=r"^[a-z0-9-]+$")
 
     @field_validator("name")
     @classmethod
@@ -106,7 +106,9 @@ class CatalogOverrideSpec(BaseModel):
 
     def to_spark_properties(self, glue_id: str) -> Dict[str, str]:
         """Build Spark properties for this catalog."""
-        templates = SPARK_CATALOG_TYPES[self.type]
+        templates = SPARK_CATALOG_TYPES.get(self.type)
+        if not templates:
+            raise ValueError(f"Unsupported catalog type: {self.type}")
         prefix = f"spark.sql.catalog.{self.name}"
 
         properties = {key.format(prefix=prefix): value for key, value in templates.items()}
@@ -127,12 +129,14 @@ def resolve_spark_catalog_overrides(
     A catalog without glue_id takes its ID from lookup_catalog_ids()
     (Athena data catalog name -> catalog ID), which is only called when needed.
     """
-    if not overrides:
+    if overrides is None:
         return {}
     if not isinstance(overrides, dict):
         raise ValueError(
             f"spark_catalog_overrides must be a dict. Got: {type(overrides).__name__}"
         )
+    if not overrides:
+        return {}
 
     specs = [CatalogOverrideSpec.from_user_dict(name, spec) for name, spec in overrides.items()]
 
@@ -141,7 +145,9 @@ def resolve_spark_catalog_overrides(
         catalog_ids = lookup_catalog_ids()
 
     return {
-        spec.name: spec.to_spark_properties(spec.resolve_glue_id(catalog_ids or {}))
+        spec.name: spec.to_spark_properties(
+            spec.resolve_glue_id(catalog_ids if catalog_ids is not None else {})
+        )
         for spec in specs
     }
 
