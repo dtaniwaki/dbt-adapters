@@ -59,8 +59,6 @@ SPARK_CATALOG_OVERRIDE_KEYS = frozenset({"type", "glue_id", "region"})
 
 
 class CatalogOverrideSpec(BaseModel):
-    """Validated catalog override specification for spark_catalog_overrides."""
-
     name: str = Field(pattern=r"^[\w][\w-]*[\w]$|^[\w]$")
     type: Literal["iceberg"]
     glue_id: Optional[str] = Field(None, pattern=r"^\d{12}$")
@@ -75,7 +73,6 @@ class CatalogOverrideSpec(BaseModel):
 
     @classmethod
     def from_user_dict(cls, name: str, spec: dict) -> "CatalogOverrideSpec":
-        """Parse user input with validation and better error messages."""
         if not isinstance(spec, dict):
             raise ValueError(f"spark_catalog_overrides[{name!r}] must be a dict")
 
@@ -92,7 +89,6 @@ class CatalogOverrideSpec(BaseModel):
             raise ValueError(f"spark_catalog_overrides[{name!r}]: {e}") from e
 
     def resolve_glue_id(self, catalog_ids: Mapping[str, str]) -> str:
-        """Resolve glue_id from catalog_ids if not set."""
         if self.glue_id:
             return self.glue_id
 
@@ -105,7 +101,6 @@ class CatalogOverrideSpec(BaseModel):
         return glue_id
 
     def to_spark_properties(self, glue_id: str) -> Dict[str, str]:
-        """Build Spark properties for this catalog."""
         templates = SPARK_CATALOG_TYPES.get(self.type)
         if not templates:
             raise ValueError(f"Unsupported catalog type: {self.type}")
@@ -124,11 +119,6 @@ class CatalogOverrideSpec(BaseModel):
 def resolve_spark_catalog_overrides(
     overrides: Any, lookup_catalog_ids: Callable[[], Mapping[str, str]]
 ) -> Dict[str, Dict[str, str]]:
-    """Turn spark_catalog_overrides into Spark properties per catalog.
-
-    A catalog without glue_id takes its ID from lookup_catalog_ids()
-    (Athena data catalog name -> catalog ID), which is only called when needed.
-    """
     if overrides is None:
         return {}
     if not isinstance(overrides, dict):
