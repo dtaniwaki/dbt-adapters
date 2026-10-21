@@ -700,6 +700,35 @@ class TestAthenaAdapter:
         assert res == {"cross_account_catalog": SHARED_DATA_CATALOG_NAME}
 
     @mock_aws
+    def test_get_spark_catalog_overrides_uses_registered_data_catalog(self, mock_aws_service):
+        mock_aws_service.create_data_catalog()
+        mock_aws_service.create_data_catalog(
+            catalog_name="cross_account_catalog",
+            catalog_type=AthenaCatalogType.GLUE,
+            catalog_id=SHARED_DATA_CATALOG_NAME,
+        )
+        self.adapter.acquire_connection("dummy")
+        self.adapter.get_spark_cross_account_catalog_map.cache_clear()
+        res = self.adapter.get_spark_catalog_overrides(
+            {"cross_account_catalog": {"type": "iceberg", "region": "eu-west-1"}}
+        )
+        props = res["cross_account_catalog"]
+        assert props["spark.sql.catalog.cross_account_catalog.glue.id"] == SHARED_DATA_CATALOG_NAME
+        assert props["spark.sql.catalog.cross_account_catalog.client.region"] == "eu-west-1"
+
+    @mock_aws
+    def test_get_spark_catalog_overrides_skips_lookup_with_glue_id(self, mock_aws_service):
+        self.adapter.acquire_connection("dummy")
+        self.adapter.get_spark_cross_account_catalog_map.cache_clear()
+        with patch.object(
+            AthenaAdapter, "get_spark_cross_account_catalog_map", side_effect=AssertionError
+        ):
+            res = self.adapter.get_spark_catalog_overrides(
+                {"shared": {"type": "iceberg", "glue_id": "123456789012"}}
+            )
+        assert res["shared"]["spark.sql.catalog.shared.glue.id"] == "123456789012"
+
+    @mock_aws
     def test_get_spark_cross_account_catalog_map_excludes_non_glue(self, mock_aws_service):
         """LAMBDA / federated catalogs must be excluded — Spark cannot read them."""
         mock_aws_service.create_data_catalog()

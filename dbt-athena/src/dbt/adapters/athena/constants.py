@@ -38,4 +38,15 @@ DEFAULT_SPARK_PROPERTIES = {
     "spark_requester_pays": {"spark.hadoop.fs.s3.useRequesterPaysHeader": "true"},
 }
 
+# Spark properties registering a named catalog, per `type` of `spark_catalog_overrides`.
+# `{prefix}` is `spark.sql.catalog.<catalog name>`.
+# https://iceberg.apache.org/docs/latest/aws/#glue-catalog
+SPARK_CATALOG_TYPES = {
+    "iceberg": {
+        "{prefix}": "org.apache.iceberg.spark.SparkCatalog",
+        "{prefix}.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+        "{prefix}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+    },
+}
+
 LOGGER = AdapterLogger(__name__)
