@@ -224,6 +224,15 @@
 
         {%- endfor -%}
 
+        {%- if partitions_batches | length == 0 -%}
+            {%- do log('NO BATCHES: creating empty target table from staging table schema') -%}
+            {%- set create_empty_sql -%}
+                select {{ dest_cols_csv }}
+                from {{ tmp_relation }}
+            {%- endset -%}
+            {%- do run_query(create_table_as(temporary, relation, create_empty_sql, language)) -%}
+        {%- endif -%}
+
     {%- else -%}
 
         {%- do log('UNPARTITIONED MODEL: CREATE TARGET TABLE FROM STAGING TABLE') -%}
@@ -232,20 +241,6 @@
         {%- endset -%}
         {%- do run_query(create_table_as(temporary, relation, create_from_staging_sql, language)) -%}
 
-    {%- endif -%}
-
-    {%- if partitions_batches | length == 0 -%}
-        {#
-          No batches found (e.g. source data is empty for the current batch window).
-          Still create the target table (empty) so post-hooks like OPTIMIZE/VACUUM
-          don't fail with TABLE_NOT_FOUND.
-        #}
-        {%- do log('NO BATCHES: creating empty target table from staging table schema') -%}
-        {%- set create_empty_sql -%}
-            select {{ dest_cols_csv }}
-            from {{ tmp_relation }}
-        {%- endset -%}
-        {%- do run_query(create_table_as(temporary, relation, create_empty_sql, language)) -%}
     {%- endif -%}
 
     {%- do drop_relation(tmp_relation) -%}

@@ -64,12 +64,12 @@ from dbt.adapters.athena.constants import (
     S3_TABLES_CATALOG_TYPE,
     S3_TABLES_GLUE_CATALOG_PREFIX,
 )
-from dbt.adapters.athena.session import get_boto3_session_from_credentials
 from dbt.adapters.athena.exceptions import (
     AthenaModelTimeoutError,
     S3LocationException,
     SnapshotMigrationRequired,
 )
+from dbt.adapters.athena.session import get_boto3_session_from_credentials
 from dbt.adapters.athena.lakeformation import (
     LfGrantsConfig,
     LfPermissions,

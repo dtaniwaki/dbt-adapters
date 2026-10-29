@@ -77,7 +77,7 @@ class MockAdapter:
     def get_columns_in_relation(self, relation):
         return self._columns
 
-    def run_query_with_partitions_limit_catching(self, sql):
+    def run_query_with_partitions_limit_catching(self, sql, disable_batch_fallback=False):
         self.last_sql = str(sql).strip()
         return self._query_result
 
@@ -407,6 +407,7 @@ def _render_create_table_as_with_contract(compiled_code, contract_sql=None):
         target=mock.Mock(),
         log=lambda *args, **kwargs: "",
         get_assert_columns_equivalent=lambda sql: checked.append(sql) or "",
+        resolve_table_type=lambda *args, **kwargs: "hive",
         relation=MockRelation("schema.tbl"),
         compiled_code=compiled_code,
         contract_sql=contract_sql,

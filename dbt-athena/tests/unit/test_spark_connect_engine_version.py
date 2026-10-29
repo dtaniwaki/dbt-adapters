@@ -52,8 +52,17 @@ def _render_save_table_as(engine_version):
         loader=jinja2.FileSystemLoader(_MACRO_DIR),
         extensions=["jinja2.ext.do"],
     )
+    env.globals["config"] = SimpleNamespace(get=lambda *_, **__: False)
+    env.globals["target"] = SimpleNamespace(
+        assume_role_arn=None,
+        assume_role_external_id=None,
+        assume_role_session_name=None,
+        region_name="us-east-1",
+    )
+    env.globals["this"] = SimpleNamespace(schema="s", identifier="t")
     env.globals["adapter"] = SimpleNamespace(
-        is_spark_connect_engine=lambda v: AthenaAdapter.is_spark_connect_engine(None, v)
+        is_spark_connect_engine=lambda v: AthenaAdapter.is_spark_connect_engine(None, v),
+        get_spark_catalog_overrides=lambda _: {},
     )
     relation = SimpleNamespace(schema="s", identifier="t")
     template = env.get_template("python_submissions.sql")
