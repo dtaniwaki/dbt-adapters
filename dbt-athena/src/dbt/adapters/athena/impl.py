@@ -62,6 +62,7 @@ from dbt.adapters.athena.constants import (
     S3_TABLES_CATALOG_TYPE,
     S3_TABLES_GLUE_CATALOG_PREFIX,
 )
+from dbt.adapters.athena.session import get_boto3_session_from_credentials
 from dbt.adapters.athena.exceptions import (
     S3LocationException,
     SnapshotMigrationRequired,
@@ -946,15 +947,14 @@ class AthenaAdapter(SQLAdapter):
         """
         account_id = self._aws_account_id
         if account_id is None:
-            conn = self.connections.get_thread_connection()
-            creds = conn.credentials
-            client = conn.handle
+            creds = self.connections.profile.credentials
+            session = get_boto3_session_from_credentials(creds)
             with boto3_client_lock:
                 account_id = self._aws_account_id
                 if account_id is None:
-                    sts = client.session.client(
+                    sts = session.client(
                         "sts",
-                        region_name=client.region_name,
+                        region_name=creds.region_name,
                         config=get_boto3_config(num_retries=creds.effective_num_retries),
                     )
                     account_id = sts.get_caller_identity()["Account"]
@@ -964,9 +964,8 @@ class AthenaAdapter(SQLAdapter):
     @lru_cache(maxsize=32)
     def _get_data_catalog(self, database: str) -> Optional[DataCatalogTypeDef]:
         if database:
-            conn = self.connections.get_thread_connection()
-            creds = conn.credentials
-            client = conn.handle
+            creds = self.connections.profile.credentials
+            session = get_boto3_session_from_credentials(creds)
             # awsdatacatalog is the default Glue catalog; S3 Tables buckets surface as
             # nested Glue federated catalogs named "s3tablescatalog/<bucket>". Both are
             # Glue-backed but are not registered as Athena DataCatalogs, so we build the
@@ -981,9 +980,9 @@ class AthenaAdapter(SQLAdapter):
                     catalog_id = f"{account_id}:{database}"
                 return {"Name": database, "Type": "GLUE", "Parameters": {"catalog-id": catalog_id}}
             with boto3_client_lock:
-                athena = client.session.client(
+                athena = session.client(
                     "athena",
-                    region_name=client.region_name,
+                    region_name=creds.region_name,
                     config=get_boto3_config(num_retries=creds.effective_num_retries),
                 )
             return athena.get_data_catalog(Name=database)["DataCatalog"]
@@ -998,13 +997,12 @@ class AthenaAdapter(SQLAdapter):
             # For non-Glue Data Catalogs, use the original Athena query against INFORMATION_SCHEMA approach
             return super().list_relations_without_caching(schema_relation)
 
-        conn = self.connections.get_thread_connection()
-        creds = conn.credentials
-        client = conn.handle
+        creds = self.connections.profile.credentials
+        session = get_boto3_session_from_credentials(creds)
         with boto3_client_lock:
-            glue_client = client.session.client(
+            glue_client = session.client(
                 "glue",
-                region_name=client.region_name,
+                region_name=creds.region_name,
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
 
@@ -1479,17 +1477,16 @@ class AthenaAdapter(SQLAdapter):
 
     @available
     def get_columns_in_relation(self, relation: AthenaRelation) -> List[AthenaColumn]:
-        conn = self.connections.get_thread_connection()
-        creds = conn.credentials
-        client = conn.handle
+        creds = self.connections.profile.credentials
+        session = get_boto3_session_from_credentials(creds)
 
         data_catalog = self._get_data_catalog(relation.database)  # type:ignore
         catalog_id = get_catalog_id(data_catalog)
 
         with boto3_client_lock:
-            glue_client = client.session.client(
+            glue_client = session.client(
                 "glue",
-                region_name=client.region_name,
+                region_name=creds.region_name,
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
 
