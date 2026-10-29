@@ -194,6 +194,7 @@
         {% do log('BATCHES TO PROCESS: ' ~ partitions_batches | length) %}
 
         {%- for batch in partitions_batches -%}
+            {%- do adapter.check_model_timeout() -%}
             {%- do log('BATCH PROCESSING: ' ~ loop.index ~ ' OF ' ~ partitions_batches | length) -%}
 
             {%- if loop.index == 1 -%}
