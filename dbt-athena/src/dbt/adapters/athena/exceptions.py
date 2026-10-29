@@ -48,3 +48,7 @@ class CancelledQueryException(AthenaQueryCancelledError):
 
 class AthenaModelTimeoutError(DbtRuntimeError):
     pass
+
+
+class SparkSessionTerminatedError(DbtRuntimeError):
+    pass
