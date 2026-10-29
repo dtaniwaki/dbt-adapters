@@ -740,6 +740,24 @@ The adapter supports Python models using [`spark`](https://docs.aws.amazon.com/a
       account. Setting this additional Spark properties parameter to true will enable querying external catalogs.
       You can use the syntax `external_catalog_id/database.table` to access the external table on the external
       catalog (ex: `999999999999/mydatabase.cloudfront_logs` where 999999999999 is the external catalog ID)
+- `spark_catalog_overrides` (`default={}`)
+    - Overrides how `dbt.source()` / `dbt.ref()` read a catalog. The key is the Athena data catalog name (the
+      `database` of the source). The Glue catalog client behind `spark_cross_account_catalog` cannot read
+      Iceberg tables, so a listed catalog is registered as a named Spark catalog on first use instead.
+      Catalogs not listed keep the behavior above.
+    - `type`: required. Only `iceberg` is supported.
+    - `glue_id`: the Glue catalog ID, as a 12-digit string (quote it in YAML). Defaults to the catalog ID of
+      the GLUE data catalog registered in Athena (which needs `athena:ListDataCatalogs` and
+      `athena:GetDataCatalog`).
+    - `region`: the region of the Glue catalog and its S3 data. Defaults to the region of the Spark session.
+    - Example:
+      ```yaml
+      config:
+        spark_catalog_overrides:
+          shared_catalog:
+            type: iceberg
+            region: eu-west-1
+      ```
 - `spark_requester_pays` (`default=false`)
     - When an Amazon S3 bucket is configured as requester pays, the account of the user running the query is charged for
       data access and data transfer fees associated with the query.
